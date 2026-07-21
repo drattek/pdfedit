@@ -1,0 +1,23 @@
+# Secrets / entorno
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+ENV/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archivo vacio suelto
+/docker
