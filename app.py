@@ -1,10 +1,13 @@
 from fastapi import FastAPI, Response, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from io import BytesIO
 import base64
 import os
 import time
+import re
+import unicodedata
 from datetime import datetime, timedelta
 import pdfplumber
 from playwright.sync_api import sync_playwright
@@ -12,17 +15,47 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.colors import white, black
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from PyPDF2 import PdfReader, PdfWriter
+# --- COMPRESORES GRÁFICOS DE ALTA DENSIDAD ---
+from PIL import Image
+from reportlab.lib.utils import ImageReader
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.26"
+VERSION = "1.44 - Filtro Homogéneo de Píxeles Decodificados"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Integración Completa)")
-print(f" FIX: Overlay con Wrap de Texto (Basado en Overlay OK)")
+print(f" FIX: Decodificación nativa de flujos mediante .image y filtro por área.")
 print(f"{'='*40}\n")
 
 # Inicialización de la aplicación FastAPI
 app = FastAPI(title=f"PDF Edit & Doosan Service v{VERSION} — Vegusa Enterprise")
+
+# Configuración de CORS para asegurar la comunicación con n8n
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =========================================================
+# LÓGICA DE DETECCIÓN Y CARGA DEL LOGO LOCAL
+# =========================================================
+LOGO_B64 = ""
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo_vegusa.png")
+
+try:
+    if os.path.exists(LOGO_PATH):
+        with open(LOGO_PATH, "rb") as img_file:
+            LOGO_B64 = base64.b64encode(img_file.read()).decode('utf-8')
+        print(f"\n>>> [LOGO VEGUSA] ¡Éxito! Imagen cargada y convertida a Base64 ({len(LOGO_B64)} caracteres).")
+    else:
+        print(f"\n>>> [LOGO VEGUSA] Aviso: No se encontró 'logo_vegusa.png' en: {LOGO_PATH}")
+        print(">>> El servicio funcionará, pero el marcador {{LOGO_VEGUSA}} no será reemplazado.")
+except Exception as e:
+    print(f"\n>>> [LOGO VEGUSA] Error crítico al procesar la imagen en el arranque: {str(e)}")
+
 
 # ---------------------------------------------------------
 # MODELOS DE DATOS (Pydantic)
@@ -36,6 +69,10 @@ class DownloadRequest(BaseModel):
     user: str
     password: str
     shipment_ids: List[str]
+
+class OptimizePDFReq(BaseModel):
+    file_b64: str
+    file_name: Optional[str] = "ine_optimizada.pdf"
 
 class Rect(BaseModel):
     page: int = Field(0, description="0-based page index")
@@ -88,6 +125,16 @@ class CustomPagesReq(BaseModel):
     file_b64: str
     pages: List[int]
 
+class ReferenceParseReq(BaseModel):
+    subject: str
+    body: Optional[str] = ""
+
+class PDFRequest(BaseModel):
+    html: str
+    razon_social: Optional[str] = "Cliente"
+    agencia_sucursal: Optional[str] = "General"
+
+
 # ---------------------------------------------------------
 # UTILIDADES INTERNAS PDF (Lógica de "Overlay OK")
 # ---------------------------------------------------------
@@ -131,10 +178,8 @@ def _overlay_rect_with_text(
             c.setLineWidth(1.2)
             c.rect(rect.x, rect.y, rect.w, rect.h, fill=False, stroke=True)
             return
-        # Tapar con recuadro blanco
         c.setFillColor(white)
         c.rect(rect.x, rect.y, rect.w, rect.h, fill=True, stroke=False)
-        # Escribir texto negro
         c.setFillColor(black)
         c.setFont(font_name, font_size)
         x, y = rect.x + 2, rect.y + rect.h - leading
@@ -160,6 +205,7 @@ def _overlay_rect_with_text(
     page.merge_page(overlay_reader.pages[0])
     for i, p in enumerate(reader.pages):
         writer.add_page(page if i == page_index else p)
+
 
 # ---------------------------------------------------------
 # UTILIDADES DOOSAN (Navegación Playwright)
@@ -227,16 +273,13 @@ def _doosan_navigate_to_results(context, user, password, f_start, f_end):
     results_frame = find_frame_with_selector(doobiz_page, 'input[type="radio"]') or content_frame
     return doobiz_page, content_frame, results_frame
 
-# ---------------------------------------------------------
-# ENDPOINTS
-# ---------------------------------------------------------
 
-@app.get("/")
-def health_check():
-    return {"status": "ok", "version": VERSION, "service": "Vegusa PDF & Doosan"}
+# ---------------------------------------------------------
+# ENDPOINTS DE LA API (BASE BASEAPP.PY)
+# ---------------------------------------------------------
 
 @app.post("/buscaInvoice")
-async def busca_invoice(req: ScrapeRequest):
+def busca_invoice(req: ScrapeRequest):
     today_dt = datetime.now()
     yesterday_dt = today_dt - timedelta(days=1)
     f_start, f_end = yesterday_dt.strftime("%Y.%m.%d"), today_dt.strftime("%Y.%m.%d")
@@ -260,7 +303,7 @@ async def busca_invoice(req: ScrapeRequest):
         finally: browser.close()
 
 @app.post("/descargaInvoice")
-async def descarga_invoice(req: DownloadRequest):
+def descarga_invoice(req: DownloadRequest):
     today_dt = datetime.now()
     f_start, f_end = (today_dt - timedelta(days=7)).strftime("%Y.%m.%d"), today_dt.strftime("%Y.%m.%d")
     files = []
@@ -288,6 +331,20 @@ async def descarga_invoice(req: DownloadRequest):
             raise HTTPException(status_code=500, detail=str(e))
         finally: browser.close()
 
+@app.post("/extract_coordinates")
+async def get_coordinates(req: CoordinateRequest):
+    try:
+        raw = base64.b64decode(req.file_b64)
+        with pdfplumber.open(BytesIO(raw)) as pdf:
+            for idx, page in enumerate(pdf.pages):
+                text_instances = page.extract_words()
+                for word in text_instances:
+                    if req.target_text.lower() in word['text'].lower():
+                        return {"status": "found", "page": idx, "x": word['x0'], "y": word['top'], "w": word['x1'] - word['x0'], "h": word['bottom'] - word['top']}
+        return {"status": "not_found"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/find_text_coords")
 async def find_text_coords(req: CoordinateRequest):
     try:
@@ -301,7 +358,7 @@ async def find_text_coords(req: CoordinateRequest):
                 if target in word['text'].upper():
                     y_coords = ph - float(word['top']) - (float(word['bottom']) - float(word['top']))
                     return {"x": word['x0'], "y": y_coords, "w": 75, "h": 12, "page": page_index, "text_found": word['text']}
-        raise HTTPException(status_code=404, detail="Texto no encontrado")
+        return {"status": "not_found"}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/edit_incoterm", response_class=Response)
@@ -309,8 +366,8 @@ async def edit_incoterm(req: IncotermReq):
     reader = _load_pdf_from_b64(req.file_b64)
     writer = PdfWriter()
     area = req.area or Rect(page=0, x=460, y=520, w=80, h=18)
-    if req.incoterm_change:
-        _overlay_rect_with_text(reader, writer, area, req.incoterm_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
+    if req.incoterm_change and req.area:
+        _overlay_rect_with_text(reader, writer, req.area, req.incoterm_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
     else:
         for p in reader.pages: writer.add_page(p)
     return Response(content=_export(writer), media_type="application/pdf")
@@ -318,26 +375,22 @@ async def edit_incoterm(req: IncotermReq):
 @app.post("/edit_billship", response_class=Response)
 async def edit_billship(req: BillShipReq):
     reader = _load_pdf_from_b64(req.file_b64)
+    writer = PdfWriter()
     bill_area = req.bill_to_area or Rect(page=0, x=72, y=560, w=220, h=80)
     ship_area = req.ship_to_area or Rect(page=0, x=300, y=560, w=250, h=80)
-    writer = PdfWriter()
-    if req.bill_to_text:
+    
+    if req.bill_to_text and req.bill_to_area:
         _overlay_rect_with_text(reader, writer, bill_area, req.bill_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
-        reader = PdfReader(BytesIO(_export(writer)))
-        writer = PdfWriter()
-    else:
-        for p in reader.pages: writer.add_page(p)
-        reader = PdfReader(BytesIO(_export(writer)))
-        writer = PdfWriter()
-    if req.ship_to_text:
+    if req.ship_to_text and req.ship_to_area:
         _overlay_rect_with_text(reader, writer, ship_area, req.ship_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
-    else:
+        
+    if not writer.pages:
         for p in reader.pages: writer.add_page(p)
+        
     return Response(content=_export(writer), media_type="application/pdf")
 
 @app.post("/overlay_text_batch", response_class=Response)
 async def overlay_text_batch(req: CustomBatchReq):
-    """Lógica de Overlay OK integrada (Multi-pass con wrap de texto)."""
     reader = _load_pdf_from_b64(req.file_b64)
     if not req.ops:
         w = PdfWriter()
@@ -345,7 +398,7 @@ async def overlay_text_batch(req: CustomBatchReq):
         return Response(content=_export(w), media_type="application/pdf")
     for op in req.ops:
         w = PdfWriter()
-        _overlay_rect_with_text(reader, w, op.area, op.text, font_name=(op.font_name or "Helvetica"), font_size=op.font_size or 9.0, leading=op.leading or 11.0, debug_outline=bool(op.debug_outline))
+        _overlay_rect_with_text(reader, w, op.area, op.text, font_name=(op.font_name or "Helvetica"), font_size=op.font_size or 9.0, leading=op.leading or 11.0, debug_outline=op.debug_outline or False)
         reader = PdfReader(BytesIO(_export(w)))
     final_writer = PdfWriter()
     for p in reader.pages: final_writer.add_page(p)
@@ -371,6 +424,243 @@ async def extract_custom_pages(req: CustomPagesReq):
         if 0 <= p_num < total:
             writer.add_page(reader.pages[p_num])
     return Response(content=_export(writer), media_type="application/pdf")
+
+@app.post("/validate_reference_request")
+def validate_reference_request(req: ReferenceParseReq):
+    asunto = (req.subject or "").upper()
+    cuerpo = (req.body or "").upper()
+    texto_completo = f"{asunto} {cuerpo}"
+
+    id_tipo = None
+    id_valor = None
+
+    curp_prefix = re.search(r'\bCURP\s*[:\-\s]\s*([A-Z0-9]{10,20})\b', texto_completo)
+    rfc_prefix = re.search(r'\bRFC\s*[:\-\s]\s*([A-Z0-9]{10,15})\b', texto_completo)
+    cliente_pattern = r'\bCLIENTE\b.{0,8}?([0-9]{4,5})\b'
+    cliente_match = re.search(cliente_pattern, texto_completo)
+
+    if not curp_prefix:
+        curp_prefix = re.search(r'\bCURP\s*[:\-\s]\s*(\S+)', texto_completo)
+    if not rfc_prefix:
+        rfc_prefix = re.search(r'\bRFC\s*[:\-\s]\s*(\S+)', texto_completo)
+
+    if cliente_match:
+        id_tipo = "NUMERO_CLIENTE"
+        id_valor = cliente_match.group(1)
+    elif rfc_prefix:
+        id_tipo = "RFC"
+        id_valor = rfc_prefix.group(1).strip()
+    elif curp_prefix:
+        id_tipo = "CURP"
+        id_valor = curp_prefix.group(1).strip()
+    else:
+        rfc_lenient = re.search(r'\b[A-Z&Ñ]{3,4}[0-9]{6}[A-Z0-9]{3}\b', texto_completo)
+        curp_lenient = re.search(r'\b[A-Z&Ñ]{4}[0-9]{6}[A-Z0-9]{8}\b', texto_completo)
+        if rfc_lenient:
+            id_tipo = "RFC"
+            id_valor = rfc_lenient.group(0)
+        elif curp_lenient:
+            id_tipo = "CURP"
+            id_valor = curp_lenient.group(0)
+        else:
+            return {
+                "status": "rejected",
+                "reason": "No se localizó un identificador legible. Asegúrese de escribir de forma clara su Número de Cliente, RFC o CURP."
+            }
+
+    RFC_STRICT = r'^[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{3}$'
+    CURP_STRICT = r'^[A-Z][AEIOUX][A-Z]{2}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM][A-Z]{2}[B-DF-HJ-NP-TV-XYZ]{3}[0-9A-Z][0-9]$'
+    CLIENTE_STRICT = r'^[0-9]{4,5}$'
+
+    is_valid = False
+    if id_tipo == "NUMERO_CLIENTE":
+        is_valid = bool(re.match(CLIENTE_STRICT, id_valor))
+    elif id_tipo == "RFC":
+        is_valid = bool(re.match(RFC_STRICT, id_valor))
+    elif id_tipo == "CURP":
+        is_valid = bool(re.match(CURP_STRICT, id_valor))
+
+    structure_status = "Válida" if is_valid else "Estructura no válida"
+
+    sucursal_encontrada = None
+    mapeo_sucursales = {
+        "Villas": [r"VILLAS", r"VILAS", r"\b331\b"],
+        "San Miguel de Allende": [r"SAN\s+MIGUEL", r"SAN\s+MIGUEL\s+DE\s+ALLENDE", r"\b135\b", r"\bSMA\b"],
+        "Guanajuato": [r"\b184\b", r"GUANAJUATO", r"\bGTO\b"],
+        "Solidaridad": [r"SOLI", r"\b192\b", r"SOLIDARIDAD"],
+        "Silao": [r"SILAO", r"\b217\b"],
+        "Salamanca": [r"\b175\b", r"SALAMANCA"]
+    }
+
+    for sucursal, patrones in mapeo_sucursales.items():
+        for patron in patrones:
+            if re.search(patron, texto_completo):
+                sucursal_encontrada = sucursal
+                break
+        if sucursal_encontrada:
+            break
+
+    if not sucursal_encontrada:
+        return {
+            "status": "rejected",
+            "reason": f"Identificador extraído ({id_tipo}: {id_valor} — {structure_status}), pero no se detectó una sucursal operativa en el correo."
+        }
+
+    return {
+        "status": "approved",
+        "search_by": id_tipo,
+        "search_value": id_valor,
+        "branch": sucursal_encontrada,
+        "structure_status": structure_status
+    }
+
+@app.post("/generate-pdf", response_class=Response)
+def generate_pdf(req: PDFRequest):
+    try:
+        html_final = req.html
+        if LOGO_B64:
+            html_final = html_final.replace("{{LOGO_VEGUSA}}", LOGO_B64)
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_content(html_final)
+            page.wait_for_load_state("networkidle")
+            
+            pdf_bytes = page.pdf(
+                format="Letter",
+                print_background=True,
+                margin={"top": "15mm", "bottom": "15mm", "left": "12mm", "right": "12mm"}
+            )
+            context.close()
+            browser.close()
+            
+        def normalizar_nombre(texto: str) -> str:
+            texto = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
+            texto = texto.strip().replace(" ", "_")
+            return re.sub(r'[^a-zA-Z0-9_\-]', '', texto)
+
+        razon_limpia = normalizar_nombre(req.razon_social or "Cliente")
+        sucursal_limpia = normalizar_nombre(req.agencia_sucursal or "General")
+        filename_final = f"Referencias_{razon_limpia}_{sucursal_limpia}.pdf"
+            
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename_final}",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+    except Exception as e:
+        print(f">>> [ERROR GENERATE-PDF]: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error en el microservicio al renderizar el PDF con Playwright: {str(e)}"
+        )
+
+
+# =========================================================================
+# ENDPOINT ACTUALIZADO DEFINITIVO: DECODIFICACIÓN NATIVA Y HEURÍSTICA DE ÁREA
+# =========================================================================
+
+@app.post("/optimizar_pdf", response_class=Response)
+async def optimizar_pdf(req: OptimizePDFReq):
+    try:
+        raw_bytes = base64.b64decode(req.file_b64)
+        reader = PdfReader(BytesIO(raw_bytes))
+        writer = PdfWriter()
+
+        print(f"\n>>> [OPTIMIZADOR DEFINITIVO] Analizando imágenes de {len(reader.pages)} páginas...")
+
+        for page in reader.pages:
+            page_optimized = False
+            
+            if page.images:
+                for image_file_object in page.images:
+                    try:
+                        # Usamos .data porque .image no existe en PyPDF2 3.0.1
+                        image_bytes = image_file_object.data
+                        img = Image.open(BytesIO(image_bytes))
+                        
+                        # MÁSCARA ALFA: Si la imagen tiene transparencia o modos indexados,
+                        # la montamos sobre un lienzo blanco para que no se pinte de negro.
+                        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                            background = Image.new("RGB", img.size, (255, 255, 255))
+                            if img.mode == "P":
+                                img = img.convert("RGBA")
+                            background.paste(img, mask=img.split()[-1])
+                            img = background
+                        elif img.mode in ("CMYK", "1", "L"):
+                            img = img.convert("RGB")
+                        else:
+                            img = img.convert("RGB")
+                        
+                        # RE-ESCALADO DE PÍXELES REAl
+                        max_pixel_dim = 1200
+                        if img.width > max_pixel_dim or img.height > max_pixel_dim:
+                            img.thumbnail((max_pixel_dim, max_pixel_dim), Image.Resampling.LANCZOS)
+                        
+                        # COMPRESIÓN JPEG AL 50%
+                        compressed_img_buffer = BytesIO()
+                        img.save(compressed_img_buffer, format="JPEG", quality=50, optimize=True)
+                        compressed_img_buffer.seek(0)
+                        
+                        # Reconstrucción de la hoja con ReportLab
+                        page_buffer = BytesIO()
+                        canvas_page = canvas.Canvas(page_buffer, pagesize=(612, 792))
+                        
+                        img_reader = ImageReader(compressed_img_buffer)
+                        canvas_page.drawImage(img_reader, 0, 0, width=612, height=792, preserveAspectRatio=True)
+                        canvas_page.showPage()
+                        canvas_page.save()
+                        page_buffer.seek(0)
+                        
+                        pdf_page_reader = PdfReader(page_buffer)
+                        writer.add_page(pdf_page_reader.pages[0])
+                        page_optimized = True
+                        break  # Optimizamos la INE principal y avanzamos de página
+                        
+                    except Exception as img_err:
+                        print(f"--> Aviso: Error en decodificación de imagen: {str(img_err)}")
+                        continue
+            
+            if not page_optimized:
+                page.scale_to(612, 792)
+                writer.add_page(page)
+
+        pdf_data = _export(writer)
+
+        # Sanitización de cabeceras Latin-1
+        nombre_original = req.file_name or "ine_optimizada.pdf"
+        nombre_seguro = "".join(
+            c for c in unicodedata.normalize("NFD", nombre_original)
+            if unicodedata.category(c) != "Mn"
+        )
+        nombre_seguro = "".join(c for c in nombre_seguro if ord(c) < 128)
+        nombre_seguro = re.sub(r'[^a-zA-Z0-9_\.-]', '_', nombre_seguro)
+        
+        if not nombre_seguro:
+            nombre_seguro = "ine_optimizada.pdf"
+
+        print(f">>> [OPTIMIZADOR] ¡Éxito! Enviando archivo binario corregido: {nombre_seguro}")
+        
+        return Response(
+            content=pdf_data,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={nombre_seguro}",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+
+    except Exception as e:
+        print(f">>> [ERROR OPTIMIZADOR]: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al procesar el PDF: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
