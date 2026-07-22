@@ -499,9 +499,10 @@ def main() -> int:
                 "az", "containerapp", "secret", "list",
                 "-n", args.app_name,
                 "-g", args.resource_group,
+                "--show-values",
             ])
             for s in secrets_list:
-                if s.get("name") == "dbpass":
+                if s.get("name") == "dbpass" and s.get("value"):
                     db_password = s.get("value")
         except Exception:
             pass
