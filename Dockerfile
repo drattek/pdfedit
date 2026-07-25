@@ -3,7 +3,7 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Dependencias del sistema para Playwright + PDFs
+# Dependencias del sistema para Playwright + PDFs + OpenCV / MediaPipe (Visión Artificial)
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libatk-bridge2.0-0 \
@@ -25,6 +25,11 @@ RUN apt-get update && apt-get install -y \
     fonts-liberation \
     fonts-unifont \
     ca-certificates \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

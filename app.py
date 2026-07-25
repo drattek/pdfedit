@@ -8,6 +8,7 @@ import os
 import time
 import re
 import unicodedata
+import urllib.request
 from datetime import datetime, timedelta
 import pdfplumber
 from playwright.sync_api import sync_playwright
@@ -15,22 +16,49 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.colors import white, black
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from PyPDF2 import PdfReader, PdfWriter
+
 # --- COMPRESORES GRÁFICOS DE ALTA DENSIDAD ---
 from PIL import Image
 from reportlab.lib.utils import ImageReader
 
+# --- LIBRERÍAS DE DETECCIÓN Y EXTRACCIÓN FACIAL ---
+import cv2
+import fitz  # PyMuPDF
+import numpy as np
+
+# --- GENERADOR DE DOCUMENTOS WORD ---
+from docx import Document
+from docx.shared import Inches, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.44 - Filtro Homogéneo de Píxeles Decodificados"
+VERSION = "1.50 - Generador Nativo Word (.docx) y Leyenda de Confidencialidad"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Integración Completa)")
-print(f" FIX: Decodificación nativa de flujos mediante .image y filtro por área.")
+print(f" NEW: Endpoint /generate-word con inserción de rostro y leyenda legal.")
 print(f"{'='*40}\n")
+
+# =========================================================
+# CARGA AUTÓNOMA DE MODELOS FACIALES
+# =========================================================
+CASCADE_PATH = os.path.join(os.path.dirname(__file__), "haarcascade_frontalface_default.xml")
+CASCADE_URL = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+
+if not os.path.exists(CASCADE_PATH):
+    try:
+        print(">>> [FACE DETECTOR] Descargando modelo de rostro OpenCV por primera vez...")
+        urllib.request.urlretrieve(CASCADE_URL, CASCADE_PATH)
+        print(">>> [FACE DETECTOR] ¡Modelo descargado con éxito!")
+    except Exception as e:
+        print(f">>> [FACE DETECTOR] Error descargando modelo: {e}")
+
+face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
 # Inicialización de la aplicación FastAPI
 app = FastAPI(title=f"PDF Edit & Doosan Service v{VERSION} — Vegusa Enterprise")
 
-# Configuración de CORS para asegurar la comunicación con n8n
+# Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,7 +80,6 @@ try:
         print(f"\n>>> [LOGO VEGUSA] ¡Éxito! Imagen cargada y convertida a Base64 ({len(LOGO_B64)} caracteres).")
     else:
         print(f"\n>>> [LOGO VEGUSA] Aviso: No se encontró 'logo_vegusa.png' en: {LOGO_PATH}")
-        print(">>> El servicio funcionará, pero el marcador {{LOGO_VEGUSA}} no será reemplazado.")
 except Exception as e:
     print(f"\n>>> [LOGO VEGUSA] Error crítico al procesar la imagen en el arranque: {str(e)}")
 
@@ -73,6 +100,10 @@ class DownloadRequest(BaseModel):
 class OptimizePDFReq(BaseModel):
     file_b64: str
     file_name: Optional[str] = "ine_optimizada.pdf"
+
+class ExtractFaceReq(BaseModel):
+    file_b64: str
+    file_name: Optional[str] = "documento.pdf"
 
 class Rect(BaseModel):
     page: int = Field(0, description="0-based page index")
@@ -134,9 +165,14 @@ class PDFRequest(BaseModel):
     razon_social: Optional[str] = "Cliente"
     agencia_sucursal: Optional[str] = "General"
 
+class WordRequest(BaseModel):
+    datosExtraidos: dict
+    rostro_b64: Optional[str] = None
+    remitente_name: Optional[str] = "Usuario Vegusa"
+
 
 # ---------------------------------------------------------
-# UTILIDADES INTERNAS PDF (Lógica de "Overlay OK")
+# UTILIDADES INTERNAS PDF
 # ---------------------------------------------------------
 
 def _load_pdf_from_b64(file_b64: str) -> PdfReader:
@@ -275,8 +311,186 @@ def _doosan_navigate_to_results(context, user, password, f_start, f_end):
 
 
 # ---------------------------------------------------------
-# ENDPOINTS DE LA API (BASE BASEAPP.PY)
+# ENDPOINTS DE LA API
 # ---------------------------------------------------------
+
+@app.post("/extraer_rostro")
+async def extraer_rostro(req: ExtractFaceReq):
+    try:
+        file_bytes = base64.b64decode(req.file_b64)
+        file_name = (req.file_name or "documento.pdf").lower()
+        img_cv2 = None
+
+        print(f"\n>>> [EXTRACTOR ROSTRO NATIVO] Procesando archivo: {file_name}")
+
+        if file_name.endswith('.pdf'):
+            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+            if len(pdf_doc) == 0:
+                return {"status": "error", "message": "El archivo PDF está vacío.", "rostro_b64": None}
+            
+            page = pdf_doc.load_page(0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+            img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            
+            if pix.n == 4:
+                img_cv2 = cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGR)
+            else:
+                img_cv2 = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        else:
+            nparr = np.frombuffer(file_bytes, np.uint8)
+            img_cv2 = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img_cv2 is None:
+            return {"status": "error", "message": "No se pudo decodificar la imagen del archivo.", "rostro_b64": None}
+
+        gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
+        gray_eq = cv2.equalizeHist(gray)
+
+        faces = face_cascade.detectMultiScale(gray_eq, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+            
+        if len(faces) == 0:
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40))
+
+        if len(faces) == 0:
+            print(">>> [EXTRACTOR ROSTRO] Aviso: No se localizó ningún rostro en el documento.")
+            return {"status": "error", "message": "No se detectó ningún rostro en el documento.", "rostro_b64": None}
+
+        faces = sorted(faces, key=lambda b: b[2] * b[3], reverse=True)
+        (x, y, w, h) = faces[0]
+
+        h_img, w_img, _ = img_cv2.shape
+        margen_y = int(h * 0.35)
+        margen_x = int(w * 0.25)
+        
+        y1 = max(0, y - margen_y)
+        y2 = min(h_img, y + h + margen_y)
+        x1 = max(0, x - margen_x)
+        x2 = min(w_img, x + w + margen_x)
+
+        rostro_recortado = img_cv2[y1:y2, x1:x2]
+        _, buffer = cv2.imencode('.jpg', rostro_recortado, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        rostro_b64 = base64.b64encode(buffer).decode('utf-8')
+
+        print(">>> [EXTRACTOR ROSTRO] ¡Éxito! Rostro extraído correctamente mediante OpenCV.")
+
+        return {
+            "status": "success",
+            "message": "Rostro extraído correctamente.",
+            "rostro_b64": rostro_b64
+        }
+
+    except Exception as e:
+        print(f">>> [ERROR EXTRACTOR ROSTRO]: {str(e)}")
+        return {"status": "error", "message": str(e), "rostro_b64": None}
+
+
+# =========================================================
+# NUEVO ENDPOINT: GENERACIÓN NATIVA DE DOCUMENTO WORD (.DOCX)
+# =========================================================
+@app.post("/generate-word", response_class=Response)
+def generate_word(req: WordRequest):
+    try:
+        print("\n>>> [GENERATE WORD] Creando archivo Word (.docx)...")
+        doc = Document()
+
+        # Configuración de márgenes
+        for section in doc.sections:
+            section.top_margin = Inches(0.6)
+            section.bottom_margin = Inches(0.6)
+            section.left_margin = Inches(0.7)
+            section.right_margin = Inches(0.7)
+
+        # 1. Agregar Logo Vegusa
+        if os.path.exists(LOGO_PATH):
+            p_logo = doc.add_paragraph()
+            p_logo.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p_logo.add_run().add_picture(LOGO_PATH, width=Inches(1.8))
+
+        # 2. Título principal
+        p_title = doc.add_paragraph()
+        p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run_title = p_title.add_run("REPORTE DE VALIDACIÓN DE IDENTIFICACIÓN (INE)")
+        run_title.bold = True
+        run_title.font.size = Pt(15)
+        run_title.font.color.rgb = RGBColor(15, 23, 42)
+
+        # 3. Foto del Rostro (si existe)
+        if req.rostro_b64:
+            try:
+                img_bytes = base64.b64decode(req.rostro_b64)
+                img_stream = BytesIO(img_bytes)
+                p_face = doc.add_paragraph()
+                p_face.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p_face.paragraph_format.space_before = Pt(10)
+                p_face.paragraph_format.space_after = Pt(10)
+                p_face.add_run().add_picture(img_stream, width=Inches(1.2))
+            except Exception as e_img:
+                print(f"--> Aviso al insertar rostro en Word: {e_img}")
+
+        # 4. Tabla de Datos Extraídos
+        datos = req.datosExtraidos or {}
+        dir_data = datos.get("direccion", {})
+
+        tabla = doc.add_table(rows=0, cols=2)
+        tabla.style = 'Table Grid'
+
+        filas = [
+            ("Nombre Completo:", f"{datos.get('nombre', '')} {datos.get('apellidos', '')}".strip()),
+            ("Fecha de Nacimiento:", datos.get("fechaNacimiento", "N/D")),
+            ("Sexo:", datos.get("sexo", "N/D")),
+            ("CURP:", datos.get("curp", "N/D")),
+            ("Clave de Elector:", datos.get("claveElector", "N/D")),
+            ("CIC / IDMEX:", datos.get("cicIdmex", "N/D")),
+            ("ID Ciudadano:", datos.get("idCiudadano", "N/D")),
+            ("Estado de Vigencia:", f"{'✔️ VIGENTE' if datos.get('vigente') else '❌ NO VIGENTE'} (Hasta {datos.get('añoVigencia', 'N/D')})"),
+            ("Calle y Número:", dir_data.get("calleNumero", "N/D")),
+            ("Colonia:", dir_data.get("colonia", "N/D")),
+            ("Ciudad / Municipio:", dir_data.get("ciudad", "N/D")),
+            ("Estado:", dir_data.get("estado", "Guanajuato")),
+            ("Código Postal:", dir_data.get("cp", "N/D"))
+        ]
+
+        for etiqueta, valor in filas:
+            row_cells = tabla.add_row().cells
+            p0 = row_cells[0].paragraphs[0]
+            r0 = p0.add_run(etiqueta)
+            r0.bold = True
+            r0.font.size = Pt(10)
+            
+            p1 = row_cells[1].paragraphs[0]
+            r1 = p1.add_run(str(valor))
+            r1.font.size = Pt(10)
+
+        # 5. Leyenda de Confidencialidad al pie del documento
+        p_disc = doc.add_paragraph()
+        p_disc.paragraph_format.space_before = Pt(25)
+        p_disc.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda estrictamente prohibida la divulgación o difusión de este archivo fuera de la empresa.")
+        run_disc.font.size = Pt(8.5)
+        run_disc.font.italic = True
+        run_disc.font.bold = True
+        run_disc.font.color.rgb = RGBColor(220, 38, 38)
+
+        # Exportar a Bytes
+        out_buf = BytesIO()
+        doc.save(out_buf)
+        docx_bytes = out_buf.getvalue()
+
+        print(">>> [GENERATE WORD] ¡Documento Word generado exitosamente!")
+
+        return Response(
+            content=docx_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": "attachment; filename=Reporte_Identificacion_Vegusa.docx",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+    except Exception as e:
+        print(f">>> [ERROR GENERATE-WORD]: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al generar documento Word: {str(e)}")
+
 
 @app.post("/buscaInvoice")
 def busca_invoice(req: ScrapeRequest):
@@ -365,7 +579,6 @@ async def find_text_coords(req: CoordinateRequest):
 async def edit_incoterm(req: IncotermReq):
     reader = _load_pdf_from_b64(req.file_b64)
     writer = PdfWriter()
-    area = req.area or Rect(page=0, x=460, y=520, w=80, h=18)
     if req.incoterm_change and req.area:
         _overlay_rect_with_text(reader, writer, req.area, req.incoterm_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
     else:
@@ -427,50 +640,64 @@ async def extract_custom_pages(req: CustomPagesReq):
 
 @app.post("/validate_reference_request")
 def validate_reference_request(req: ReferenceParseReq):
-    asunto = (req.subject or "").upper()
-    cuerpo = (req.body or "").upper()
+    def normalizar_texto(texto: str) -> str:
+        if not texto:
+            return ""
+        texto_norm = unicodedata.normalize('NFD', texto)
+        texto_sin_acentos = ''.join(c for c in texto_norm if unicodedata.category(c) != 'Mn')
+        return texto_sin_acentos.upper().strip()
+
+    asunto = normalizar_texto(req.subject)
+    cuerpo = normalizar_texto(req.body)
     texto_completo = f"{asunto} {cuerpo}"
 
     id_tipo = None
     id_valor = None
 
-    curp_prefix = re.search(r'\bCURP\s*[:\-\s]\s*([A-Z0-9]{10,20})\b', texto_completo)
-    rfc_prefix = re.search(r'\bRFC\s*[:\-\s]\s*([A-Z0-9]{10,15})\b', texto_completo)
-    cliente_pattern = r'\bCLIENTE\b.{0,8}?([0-9]{4,5})\b'
-    cliente_match = re.search(cliente_pattern, texto_completo)
-
-    if not curp_prefix:
-        curp_prefix = re.search(r'\bCURP\s*[:\-\s]\s*(\S+)', texto_completo)
-    if not rfc_prefix:
-        rfc_prefix = re.search(r'\bRFC\s*[:\-\s]\s*(\S+)', texto_completo)
+    cliente_match = re.search(r'\b(CLIENTE|NO\.?\s*CLIENTE|NUMERO\s*DE?\s*CLIENTE)\b.{0,8}?([0-9]{4,6})\b', texto_completo)
+    rfc_prefix = re.search(r'\bRFC\s*[:\-\s]\s*([A-Z0-9\-\s]{10,16})\b', texto_completo)
+    curp_prefix = re.search(r'\bCURP\s*[:\-\s]\s*([A-Z0-9\-\s]{18,22})\b', texto_completo)
 
     if cliente_match:
         id_tipo = "NUMERO_CLIENTE"
-        id_valor = cliente_match.group(1)
+        id_valor = cliente_match.group(2).strip()
     elif rfc_prefix:
         id_tipo = "RFC"
-        id_valor = rfc_prefix.group(1).strip()
+        id_valor = re.sub(r'[\s\-]', '', rfc_prefix.group(1))
     elif curp_prefix:
         id_tipo = "CURP"
-        id_valor = curp_prefix.group(1).strip()
+        id_valor = re.sub(r'[\s\-]', '', curp_prefix.group(1))
     else:
-        rfc_lenient = re.search(r'\b[A-Z&Ñ]{3,4}[0-9]{6}[A-Z0-9]{3}\b', texto_completo)
-        curp_lenient = re.search(r'\b[A-Z&Ñ]{4}[0-9]{6}[A-Z0-9]{8}\b', texto_completo)
-        if rfc_lenient:
+        if not curp_prefix:
+            curp_prefix = re.search(r'\bCURP\s*[:\-\s]*([A-Z0-9]{18})\b', texto_completo)
+        if not rfc_prefix:
+            rfc_prefix = re.search(r'\bRFC\s*[:\-\s]*([A-Z0-9]{12,13})\b', texto_completo)
+
+        if rfc_prefix:
             id_tipo = "RFC"
-            id_valor = rfc_lenient.group(0)
-        elif curp_lenient:
+            id_valor = rfc_prefix.group(1).strip()
+        elif curp_prefix:
             id_tipo = "CURP"
-            id_valor = curp_lenient.group(0)
+            id_valor = curp_prefix.group(1).strip()
         else:
-            return {
-                "status": "rejected",
-                "reason": "No se localizó un identificador legible. Asegúrese de escribir de forma clara su Número de Cliente, RFC o CURP."
-            }
+            rfc_lenient = re.search(r'\b[A-Z&Ñ]{3,4}[0-9]{6}[A-Z0-9]{3}\b', texto_completo)
+            curp_lenient = re.search(r'\b[A-Z&Ñ]{4}[0-9]{6}[A-Z0-9]{8}\b', texto_completo)
+            
+            if rfc_lenient:
+                id_tipo = "RFC"
+                id_valor = rfc_lenient.group(0)
+            elif curp_lenient:
+                id_tipo = "CURP"
+                id_valor = curp_lenient.group(0)
+            else:
+                return {
+                    "status": "rejected",
+                    "reason": "No se localizó un identificador legible. Asegúrese de escribir de forma clara su Número de Cliente, RFC o CURP."
+                }
 
     RFC_STRICT = r'^[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{3}$'
     CURP_STRICT = r'^[A-Z][AEIOUX][A-Z]{2}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM][A-Z]{2}[B-DF-HJ-NP-TV-XYZ]{3}[0-9A-Z][0-9]$'
-    CLIENTE_STRICT = r'^[0-9]{4,5}$'
+    CLIENTE_STRICT = r'^[0-9]{4,6}$'
 
     is_valid = False
     if id_tipo == "NUMERO_CLIENTE":
@@ -482,23 +709,48 @@ def validate_reference_request(req: ReferenceParseReq):
 
     structure_status = "Válida" if is_valid else "Estructura no válida"
 
-    sucursal_encontrada = None
     mapeo_sucursales = {
-        "Villas": [r"VILLAS", r"VILAS", r"\b331\b"],
-        "San Miguel de Allende": [r"SAN\s+MIGUEL", r"SAN\s+MIGUEL\s+DE\s+ALLENDE", r"\b135\b", r"\bSMA\b"],
-        "Guanajuato": [r"\b184\b", r"GUANAJUATO", r"\bGTO\b"],
-        "Solidaridad": [r"SOLI", r"\b192\b", r"SOLIDARIDAD"],
-        "Silao": [r"SILAO", r"\b217\b"],
-        "Salamanca": [r"\b175\b", r"SALAMANCA"]
+        "Villas": [r"\bVILLAS?\b", r"\b331\b"],
+        "San Miguel de Allende": [r"\bSAN\s+MIGUEL\b", r"\bSAN\s+MIGUEL\s+DE\s+ALLENDE\b", r"\b135\b", r"\bSMA\b"],
+        "Guanajuato": [r"\b184\b", r"\bGUANAJUATO\b", r"\bGTO\b"],
+        "Solidaridad": [r"\bSOLI\b", r"\bSOLIDARIDAD\b", r"\b192\b"],
+        "Silao": [r"\bSILAO\b", r"\b217\b"],
+        "Salamanca": [r"\bSALAMANCA\b", r"\b175\b"]
     }
 
-    for sucursal, patrones in mapeo_sucursales.items():
-        for patron in patrones:
-            if re.search(patron, texto_completo):
-                sucursal_encontrada = sucursal
+    def obtener_primera_coincidencia(texto: str) -> Optional[str]:
+        if not texto:
+            return None
+        matches = []
+        for sucursal, patrones in mapeo_sucursales.items():
+            for patron in patrones:
+                m = re.search(patron, texto)
+                if m:
+                    matches.append({"pos": m.start(), "sucursal": sucursal})
+                    break
+        if not matches:
+            return None
+        matches.sort(key=lambda x: x["pos"])
+        return matches[0]["sucursal"]
+
+    sucursal_encontrada = obtener_primera_coincidencia(asunto)
+
+    if not sucursal_encontrada and cuerpo:
+        cuerpo_limpio = re.split(r'_{3,}|={3,}|-{3,}|(?:\r?\n){2,}--\s*', cuerpo)[0]
+
+        for sucursal, patrones in mapeo_sucursales.items():
+            for patron in patrones:
+                if re.search(r'\b(SUCURSAL|SUC|AGENCIA|PLAZA)\b.{0,15}?' + patron, cuerpo_limpio):
+                    sucursal_encontrada = sucursal
+                    break
+            if sucursal_encontrada:
                 break
-        if sucursal_encontrada:
-            break
+
+        if not sucursal_encontrada:
+            sucursal_encontrada = obtener_primera_coincidencia(cuerpo_limpio)
+
+    if not sucursal_encontrada and cuerpo:
+        sucursal_encontrada = obtener_primera_coincidencia(cuerpo)
 
     if not sucursal_encontrada:
         return {
@@ -513,6 +765,7 @@ def validate_reference_request(req: ReferenceParseReq):
         "branch": sucursal_encontrada,
         "structure_status": structure_status
     }
+
 
 @app.post("/generate-pdf", response_class=Response)
 def generate_pdf(req: PDFRequest):
@@ -564,10 +817,6 @@ def generate_pdf(req: PDFRequest):
         )
 
 
-# =========================================================================
-# ENDPOINT ACTUALIZADO DEFINITIVO: DECODIFICACIÓN NATIVA Y HEURÍSTICA DE ÁREA
-# =========================================================================
-
 @app.post("/optimizar_pdf", response_class=Response)
 async def optimizar_pdf(req: OptimizePDFReq):
     try:
@@ -583,12 +832,9 @@ async def optimizar_pdf(req: OptimizePDFReq):
             if page.images:
                 for image_file_object in page.images:
                     try:
-                        # Usamos .data porque .image no existe en PyPDF2 3.0.1
                         image_bytes = image_file_object.data
                         img = Image.open(BytesIO(image_bytes))
                         
-                        # MÁSCARA ALFA: Si la imagen tiene transparencia o modos indexados,
-                        # la montamos sobre un lienzo blanco para que no se pinte de negro.
                         if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
                             background = Image.new("RGB", img.size, (255, 255, 255))
                             if img.mode == "P":
@@ -600,17 +846,14 @@ async def optimizar_pdf(req: OptimizePDFReq):
                         else:
                             img = img.convert("RGB")
                         
-                        # RE-ESCALADO DE PÍXELES REAl
                         max_pixel_dim = 1200
                         if img.width > max_pixel_dim or img.height > max_pixel_dim:
                             img.thumbnail((max_pixel_dim, max_pixel_dim), Image.Resampling.LANCZOS)
                         
-                        # COMPRESIÓN JPEG AL 50%
                         compressed_img_buffer = BytesIO()
                         img.save(compressed_img_buffer, format="JPEG", quality=50, optimize=True)
                         compressed_img_buffer.seek(0)
                         
-                        # Reconstrucción de la hoja con ReportLab
                         page_buffer = BytesIO()
                         canvas_page = canvas.Canvas(page_buffer, pagesize=(612, 792))
                         
@@ -623,7 +866,7 @@ async def optimizar_pdf(req: OptimizePDFReq):
                         pdf_page_reader = PdfReader(page_buffer)
                         writer.add_page(pdf_page_reader.pages[0])
                         page_optimized = True
-                        break  # Optimizamos la INE principal y avanzamos de página
+                        break  
                         
                     except Exception as img_err:
                         print(f"--> Aviso: Error en decodificación de imagen: {str(img_err)}")
@@ -635,7 +878,6 @@ async def optimizar_pdf(req: OptimizePDFReq):
 
         pdf_data = _export(writer)
 
-        # Sanitización de cabeceras Latin-1
         nombre_original = req.file_name or "ine_optimizada.pdf"
         nombre_seguro = "".join(
             c for c in unicodedata.normalize("NFD", nombre_original)
