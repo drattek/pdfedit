@@ -1,4 +1,23 @@
+"""
+===============================================================================
+INSTRUCCIONES PERMANENTES PARA IA / GEMINI (DIRECTIVAS DE EDICIÓN QUIRÚRGICA)
+===============================================================================
+1. PRESERVACIÓN DE ENDPOINTS:
+   - Este script contiene MÚLTIPLES endpoints de FastAPI.
+   - NUNCA omitas, resumas ni elimines endpoints existentes a menos que se solicite explícitamente.
+   - NUNCA uses comentarios de omisión como "# ... resto del código permanece igual ...".
+
+2. EDICIÓN AISLADA:
+   - Modifica ÚNICAMENTE las funciones o endpoints indicados en la solicitud.
+   - Mantén intactos los parámetros, lógica e importaciones de los demás endpoints.
+
+3. REGLA DE RESPUESTA COMPLETA:
+   - Devuelve SIEMPRE el archivo Python completo ejecutable sin cortes ni elisiones.
+===============================================================================
+"""
+
 from fastapi import FastAPI, Response, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -32,11 +51,10 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.50 - Generador Nativo Word (.docx) y Leyenda de Confidencialidad"
+VERSION = "1.80 - Fusión Completa (Descarga de Archivos de Almacenamiento Local + Endpoints Doosan/PDF)"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Integración Completa)")
-print(f" NEW: Endpoint /generate-word con inserción de rostro y leyenda legal.")
+print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80)")
 print(f"{'='*40}\n")
 
 # =========================================================
@@ -55,10 +73,8 @@ if not os.path.exists(CASCADE_PATH):
 
 face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
-# Inicialización de la aplicación FastAPI
 app = FastAPI(title=f"PDF Edit & Doosan Service v{VERSION} — Vegusa Enterprise")
 
-# Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,7 +84,7 @@ app.add_middleware(
 )
 
 # =========================================================
-# LÓGICA DE DETECCIÓN Y CARGA DEL LOGO LOCAL
+# CARGA DEL LOGO LOCAL
 # =========================================================
 LOGO_B64 = ""
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo_vegusa.png")
@@ -77,11 +93,23 @@ try:
     if os.path.exists(LOGO_PATH):
         with open(LOGO_PATH, "rb") as img_file:
             LOGO_B64 = base64.b64encode(img_file.read()).decode('utf-8')
-        print(f"\n>>> [LOGO VEGUSA] ¡Éxito! Imagen cargada y convertida a Base64 ({len(LOGO_B64)} caracteres).")
+        print(f"\n>>> [LOGO VEGUSA] ¡Éxito! Imagen cargada ({len(LOGO_B64)} caracteres Base64).")
     else:
         print(f"\n>>> [LOGO VEGUSA] Aviso: No se encontró 'logo_vegusa.png' en: {LOGO_PATH}")
 except Exception as e:
-    print(f"\n>>> [LOGO VEGUSA] Error crítico al procesar la imagen en el arranque: {str(e)}")
+    print(f"\n>>> [LOGO VEGUSA] Error al cargar la imagen: {str(e)}")
+
+
+# ---------------------------------------------------------
+# UTILIDAD GLOBAL DE LIMPIEZA DE NOMBRES
+# ---------------------------------------------------------
+def normalizar_nombre(texto: str) -> str:
+    if not texto:
+        return "Cliente"
+    texto_norm = unicodedata.normalize('NFD', texto)
+    texto_sin_acentos = ''.join(c for c in texto_norm if unicodedata.category(c) != 'Mn')
+    texto_limpio = texto_sin_acentos.strip().replace(" ", "_")
+    return re.sub(r'[^a-zA-Z0-9_\-]', '', texto_limpio)
 
 
 # ---------------------------------------------------------
@@ -104,6 +132,7 @@ class OptimizePDFReq(BaseModel):
 class ExtractFaceReq(BaseModel):
     file_b64: str
     file_name: Optional[str] = "documento.pdf"
+    angle: float = 0.0
 
 class Rect(BaseModel):
     page: int = Field(0, description="0-based page index")
@@ -162,17 +191,19 @@ class ReferenceParseReq(BaseModel):
 
 class PDFRequest(BaseModel):
     html: str
+    prefijo: Optional[str] = "Identificacion"
     razon_social: Optional[str] = "Cliente"
-    agencia_sucursal: Optional[str] = "General"
+    agencia_sucursal: Optional[str] = ""
 
 class WordRequest(BaseModel):
     datosExtraidos: dict
     rostro_b64: Optional[str] = None
-    remitente_name: Optional[str] = "Usuario Vegusa"
+    remitente_name: Optional[str] = "Cliente"
+    prefijo: Optional[str] = "Identificacion"
 
 
 # ---------------------------------------------------------
-# UTILIDADES INTERNAS PDF
+# UTILIDADES INTERNAS PDF Y DOOSAN
 # ---------------------------------------------------------
 
 def _load_pdf_from_b64(file_b64: str) -> PdfReader:
@@ -243,10 +274,6 @@ def _overlay_rect_with_text(
         writer.add_page(page if i == page_index else p)
 
 
-# ---------------------------------------------------------
-# UTILIDADES DOOSAN (Navegación Playwright)
-# ---------------------------------------------------------
-
 class AuthException(Exception):
     pass
 
@@ -314,6 +341,7 @@ def _doosan_navigate_to_results(context, user, password, f_start, f_end):
 # ENDPOINTS DE LA API
 # ---------------------------------------------------------
 
+# --- ENDPOINT 1: EXTRAER ROSTRO (Versión 1.70 - Rotación Corregida) ---
 @app.post("/extraer_rostro")
 async def extraer_rostro(req: ExtractFaceReq):
     try:
@@ -321,7 +349,7 @@ async def extraer_rostro(req: ExtractFaceReq):
         file_name = (req.file_name or "documento.pdf").lower()
         img_cv2 = None
 
-        print(f"\n>>> [EXTRACTOR ROSTRO NATIVO] Procesando archivo: {file_name}")
+        print(f"\n>>> [EXTRACTOR ROSTRO NATIVO] Procesando archivo: {file_name} (Ángulo recibido: {req.angle}°)")
 
         if file_name.endswith('.pdf'):
             pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -343,13 +371,33 @@ async def extraer_rostro(req: ExtractFaceReq):
         if img_cv2 is None:
             return {"status": "error", "message": "No se pudo decodificar la imagen del archivo.", "rostro_b64": None}
 
+        # --- 1. ENDEREZADO MATEMÁTICO DIRECTO ---
+        if req.angle != 0:
+            (h, w) = img_cv2.shape[:2]
+            center = (w // 2, h // 2)
+            
+            angulo_corregido = float(req.angle)
+            M = cv2.getRotationMatrix2D(center, angulo_corregido, 1.0)
+            
+            abs_cos = abs(M[0, 0])
+            abs_sin = abs(M[0, 1])
+            bound_w = int(h * abs_sin + w * abs_cos)
+            bound_h = int(h * abs_cos + w * abs_sin)
+            
+            M[0, 2] += bound_w / 2 - center[0]
+            M[1, 2] += bound_h / 2 - center[1]
+            
+            img_cv2 = cv2.warpAffine(img_cv2, M, (bound_w, bound_h), borderValue=(255, 255, 255))
+            print(f">>> [EXTRACTOR ROSTRO] Documento enderezado a {angulo_corregido}° exitosamente.")
+
+        # --- 2. BÚSQUEDA DEL ROSTRO ---
         gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
         gray_eq = cv2.equalizeHist(gray)
 
-        faces = face_cascade.detectMultiScale(gray_eq, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        faces = face_cascade.detectMultiScale(gray_eq, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
             
         if len(faces) == 0:
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40))
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(50, 50))
 
         if len(faces) == 0:
             print(">>> [EXTRACTOR ROSTRO] Aviso: No se localizó ningún rostro en el documento.")
@@ -359,8 +407,8 @@ async def extraer_rostro(req: ExtractFaceReq):
         (x, y, w, h) = faces[0]
 
         h_img, w_img, _ = img_cv2.shape
-        margen_y = int(h * 0.35)
-        margen_x = int(w * 0.25)
+        margen_y = int(h * 0.25)
+        margen_x = int(w * 0.20)
         
         y1 = max(0, y - margen_y)
         y2 = min(h_img, y + h + margen_y)
@@ -384,29 +432,75 @@ async def extraer_rostro(req: ExtractFaceReq):
         return {"status": "error", "message": str(e), "rostro_b64": None}
 
 
-# =========================================================
-# NUEVO ENDPOINT: GENERACIÓN NATIVA DE DOCUMENTO WORD (.DOCX)
-# =========================================================
+# --- ENDPOINT 2: GENERAR PDF (Versión 1.70 - Nombres Dinámicos) ---
+@app.post("/generate-pdf", response_class=Response)
+def generate_pdf(req: PDFRequest):
+    try:
+        html_final = req.html
+        if LOGO_B64:
+            html_final = html_final.replace("{{LOGO_VEGUSA}}", LOGO_B64)
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_content(html_final)
+            page.wait_for_load_state("networkidle")
+            
+            pdf_bytes = page.pdf(
+                format="Letter",
+                print_background=True,
+                margin={"top": "15mm", "bottom": "15mm", "left": "12mm", "right": "12mm"}
+            )
+            context.close()
+            browser.close()
+            
+        prefijo_limpio = normalizar_nombre(req.prefijo or "Identificacion")
+        razon_limpia = normalizar_nombre(req.razon_social or "Cliente")
+        
+        if req.agencia_sucursal and req.agencia_sucursal.lower() != "general":
+            sucursal_limpia = normalizar_nombre(req.agencia_sucursal)
+            filename_final = f"{prefijo_limpio}_{razon_limpia}_{sucursal_limpia}.pdf"
+        else:
+            filename_final = f"{prefijo_limpio}_{razon_limpia}.pdf"
+            
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename_final}",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+    except Exception as e:
+        print(f">>> [ERROR GENERATE-PDF]: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al renderizar el PDF: {str(e)}"
+        )
+
+
+# --- ENDPOINT 3: GENERAR WORD (Versión 1.70 - Nombres Dinámicos) ---
 @app.post("/generate-word", response_class=Response)
 def generate_word(req: WordRequest):
     try:
         print("\n>>> [GENERATE WORD] Creando archivo Word (.docx)...")
         doc = Document()
 
-        # Configuración de márgenes
         for section in doc.sections:
             section.top_margin = Inches(0.6)
             section.bottom_margin = Inches(0.6)
             section.left_margin = Inches(0.7)
             section.right_margin = Inches(0.7)
 
-        # 1. Agregar Logo Vegusa
         if os.path.exists(LOGO_PATH):
             p_logo = doc.add_paragraph()
             p_logo.alignment = WD_ALIGN_PARAGRAPH.LEFT
             p_logo.add_run().add_picture(LOGO_PATH, width=Inches(1.8))
 
-        # 2. Título principal
         p_title = doc.add_paragraph()
         p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run_title = p_title.add_run("REPORTE DE VALIDACIÓN DE IDENTIFICACIÓN (INE)")
@@ -414,7 +508,6 @@ def generate_word(req: WordRequest):
         run_title.font.size = Pt(15)
         run_title.font.color.rgb = RGBColor(15, 23, 42)
 
-        # 3. Foto del Rostro (si existe)
         if req.rostro_b64:
             try:
                 img_bytes = base64.b64decode(req.rostro_b64)
@@ -427,7 +520,6 @@ def generate_word(req: WordRequest):
             except Exception as e_img:
                 print(f"--> Aviso al insertar rostro en Word: {e_img}")
 
-        # 4. Tabla de Datos Extraídos
         datos = req.datosExtraidos or {}
         dir_data = datos.get("direccion", {})
 
@@ -461,7 +553,6 @@ def generate_word(req: WordRequest):
             r1 = p1.add_run(str(valor))
             r1.font.size = Pt(10)
 
-        # 5. Leyenda de Confidencialidad al pie del documento
         p_disc = doc.add_paragraph()
         p_disc.paragraph_format.space_before = Pt(25)
         p_disc.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -472,18 +563,25 @@ def generate_word(req: WordRequest):
         run_disc.font.bold = True
         run_disc.font.color.rgb = RGBColor(220, 38, 38)
 
-        # Exportar a Bytes
         out_buf = BytesIO()
         doc.save(out_buf)
         docx_bytes = out_buf.getvalue()
 
-        print(">>> [GENERATE WORD] ¡Documento Word generado exitosamente!")
+        nombre_persona_extraido = f"{datos.get('nombre', '')} {datos.get('apellidos', '')}".strip()
+        nombre_base = nombre_persona_extraido if nombre_persona_extraido else (req.remitente_name or "Cliente")
+        
+        nombre_limpio = normalizar_nombre(nombre_base)
+        prefijo_limpio = normalizar_nombre(req.prefijo or "Identificacion")
+        
+        filename_final = f"{prefijo_limpio}_{nombre_limpio}.docx"
+
+        print(f">>> [GENERATE WORD] ¡Éxito! Archivo generado: {filename_final}")
 
         return Response(
             content=docx_bytes,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={
-                "Content-Disposition": "attachment; filename=Reporte_Identificacion_Vegusa.docx",
+                "Content-Disposition": f"attachment; filename={filename_final}",
                 "Access-Control-Expose-Headers": "Content-Disposition"
             }
         )
@@ -492,6 +590,78 @@ def generate_word(req: WordRequest):
         raise HTTPException(status_code=500, detail=f"Error al generar documento Word: {str(e)}")
 
 
+# --- ENDPOINT 4: OPTIMIZAR PDF ---
+@app.post("/optimizar_pdf", response_class=Response)
+async def optimizar_pdf(req: OptimizePDFReq):
+    try:
+        raw_bytes = base64.b64decode(req.file_b64)
+        reader = PdfReader(BytesIO(raw_bytes))
+        writer = PdfWriter()
+
+        for page in reader.pages:
+            page_optimized = False
+            if page.images:
+                for image_file_object in page.images:
+                    try:
+                        image_bytes = image_file_object.data
+                        img = Image.open(BytesIO(image_bytes))
+                        
+                        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                            background = Image.new("RGB", img.size, (255, 255, 255))
+                            if img.mode == "P": img = img.convert("RGBA")
+                            background.paste(img, mask=img.split()[-1])
+                            img = background
+                        else:
+                            img = img.convert("RGB")
+                        
+                        max_pixel_dim = 1200
+                        if img.width > max_pixel_dim or img.height > max_pixel_dim:
+                            img.thumbnail((max_pixel_dim, max_pixel_dim), Image.Resampling.LANCZOS)
+                        
+                        compressed_img_buffer = BytesIO()
+                        img.save(compressed_img_buffer, format="JPEG", quality=50, optimize=True)
+                        compressed_img_buffer.seek(0)
+                        
+                        page_buffer = BytesIO()
+                        canvas_page = canvas.Canvas(page_buffer, pagesize=(612, 792))
+                        img_reader = ImageReader(compressed_img_buffer)
+                        canvas_page.drawImage(img_reader, 0, 0, width=612, height=792, preserveAspectRatio=True)
+                        canvas_page.showPage()
+                        canvas_page.save()
+                        page_buffer.seek(0)
+                        
+                        pdf_page_reader = PdfReader(page_buffer)
+                        writer.add_page(pdf_page_reader.pages[0])
+                        page_optimized = True
+                        break  
+                    except Exception: continue
+            
+            if not page_optimized:
+                page.scale_to(612, 792)
+                writer.add_page(page)
+
+        pdf_data = _export(writer)
+        nombre_original = req.file_name or "ine_optimizada.pdf"
+        nombre_seguro = normalizar_nombre(nombre_original)
+        if not nombre_seguro.endswith(".pdf"): nombre_seguro += ".pdf"
+
+        return Response(
+            content=pdf_data,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={nombre_seguro}",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al procesar el PDF: {str(e)}")
+
+
+# =========================================================
+# ENDPOINTS RECUPERADOS DE LA VERSIÓN 1.60
+# =========================================================
+
+# --- ENDPOINT 5: BUSCA INVOICE DOOSAN ---
 @app.post("/buscaInvoice")
 def busca_invoice(req: ScrapeRequest):
     today_dt = datetime.now()
@@ -516,6 +686,8 @@ def busca_invoice(req: ScrapeRequest):
             raise HTTPException(status_code=500, detail=str(e))
         finally: browser.close()
 
+
+# --- ENDPOINT 6: DESCARGA INVOICE DOOSAN ---
 @app.post("/descargaInvoice")
 def descarga_invoice(req: DownloadRequest):
     today_dt = datetime.now()
@@ -545,6 +717,8 @@ def descarga_invoice(req: DownloadRequest):
             raise HTTPException(status_code=500, detail=str(e))
         finally: browser.close()
 
+
+# --- ENDPOINT 7: EXTRACT COORDINATES ---
 @app.post("/extract_coordinates")
 async def get_coordinates(req: CoordinateRequest):
     try:
@@ -559,6 +733,8 @@ async def get_coordinates(req: CoordinateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# --- ENDPOINT 8: FIND TEXT COORDS ---
 @app.post("/find_text_coords")
 async def find_text_coords(req: CoordinateRequest):
     try:
@@ -575,6 +751,8 @@ async def find_text_coords(req: CoordinateRequest):
         return {"status": "not_found"}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
+
+# --- ENDPOINT 9: EDIT INCOTERM ---
 @app.post("/edit_incoterm", response_class=Response)
 async def edit_incoterm(req: IncotermReq):
     reader = _load_pdf_from_b64(req.file_b64)
@@ -585,6 +763,8 @@ async def edit_incoterm(req: IncotermReq):
         for p in reader.pages: writer.add_page(p)
     return Response(content=_export(writer), media_type="application/pdf")
 
+
+# --- ENDPOINT 10: EDIT BILLSHIP ---
 @app.post("/edit_billship", response_class=Response)
 async def edit_billship(req: BillShipReq):
     reader = _load_pdf_from_b64(req.file_b64)
@@ -602,6 +782,8 @@ async def edit_billship(req: BillShipReq):
         
     return Response(content=_export(writer), media_type="application/pdf")
 
+
+# --- ENDPOINT 11: OVERLAY TEXT BATCH ---
 @app.post("/overlay_text_batch", response_class=Response)
 async def overlay_text_batch(req: CustomBatchReq):
     reader = _load_pdf_from_b64(req.file_b64)
@@ -617,6 +799,8 @@ async def overlay_text_batch(req: CustomBatchReq):
     for p in reader.pages: final_writer.add_page(p)
     return Response(content=_export(final_writer), media_type="application/pdf")
 
+
+# --- ENDPOINT 12: CUT RANGE ---
 @app.post("/cut_range", response_class=Response)
 async def cut_range(req: CutRangeReq):
     reader = _load_pdf_from_b64(req.file_b64)
@@ -628,6 +812,8 @@ async def cut_range(req: CutRangeReq):
         writer.add_page(reader.pages[i])
     return Response(content=_export(writer), media_type="application/pdf")
 
+
+# --- ENDPOINT 13: EXTRACT CUSTOM PAGES ---
 @app.post("/extract_custom_pages", response_class=Response)
 async def extract_custom_pages(req: CustomPagesReq):
     reader = _load_pdf_from_b64(req.file_b64)
@@ -638,6 +824,8 @@ async def extract_custom_pages(req: CustomPagesReq):
             writer.add_page(reader.pages[p_num])
     return Response(content=_export(writer), media_type="application/pdf")
 
+
+# --- ENDPOINT 14: VALIDATE REFERENCE REQUEST ---
 @app.post("/validate_reference_request")
 def validate_reference_request(req: ReferenceParseReq):
     def normalizar_texto(texto: str) -> str:
@@ -690,6 +878,7 @@ def validate_reference_request(req: ReferenceParseReq):
                 id_tipo = "CURP"
                 id_valor = curp_lenient.group(0)
             else:
+                # ESTADO: RECHAZADO (Sin ID válido)
                 return {
                     "status": "rejected",
                     "reason": "No se localizó un identificador legible. Asegúrese de escribir de forma clara su Número de Cliente, RFC o CURP."
@@ -752,12 +941,18 @@ def validate_reference_request(req: ReferenceParseReq):
     if not sucursal_encontrada and cuerpo:
         sucursal_encontrada = obtener_primera_coincidencia(cuerpo)
 
+    # NUEVO ESTADO: IDCliente (ID válido, pero sin sucursal)
     if not sucursal_encontrada:
         return {
-            "status": "rejected",
-            "reason": f"Identificador extraído ({id_tipo}: {id_valor} — {structure_status}), pero no se detectó una sucursal operativa en el correo."
+            "status": "IDCliente",
+            "search_by": id_tipo,
+            "search_value": id_valor,
+            "branch": "GENERAL",
+            "structure_status": structure_status,
+            "reason": "No se introdujo Sucursal, te muestro las referencias que tiene activas el cliente."
         }
 
+    # ESTADO: APROBADO (ID válido y sucursal encontrada)
     return {
         "status": "approved",
         "search_by": id_tipo,
@@ -766,143 +961,40 @@ def validate_reference_request(req: ReferenceParseReq):
         "structure_status": structure_status
     }
 
-
-@app.post("/generate-pdf", response_class=Response)
-def generate_pdf(req: PDFRequest):
+# --- ENDPOINT 15: DESCARGAR ARCHIVO LOCAL/ALMACENAMIENTO (NUEVO) ---
+@app.get("/descargar_archivo/{filepath:path}")
+async def descargar_archivo(filepath: str):
+    """
+    Descarga cualquier archivo almacenado en el microservicio o sus volúmenes.
+    Ejemplo de llamada: GET /descargar_archivo/archivos/mi_documento.pdf
+    O: GET /descargar_archivo/logo_vegusa.png
+    """
     try:
-        html_final = req.html
-        if LOGO_B64:
-            html_final = html_final.replace("{{LOGO_VEGUSA}}", LOGO_B64)
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        target_path = os.path.abspath(os.path.join(base_dir, filepath))
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        # Validación anti-Directory Traversal (Evita acceder fuera del contenedor/app)
+        if not target_path.startswith(base_dir):
+            raise HTTPException(
+                status_code=400, 
+                detail="Acceso denegado: Intento de acceso a una ruta fuera del directorio permitido."
             )
-            context = browser.new_context()
-            page = context.new_page()
-            page.set_content(html_final)
-            page.wait_for_load_state("networkidle")
-            
-            pdf_bytes = page.pdf(
-                format="Letter",
-                print_background=True,
-                margin={"top": "15mm", "bottom": "15mm", "left": "12mm", "right": "12mm"}
+
+        if not os.path.exists(target_path) or not os.path.isfile(target_path):
+            raise HTTPException(
+                status_code=404, 
+                detail=f"El archivo '{filepath}' no existe o no se encuentra disponible."
             )
-            context.close()
-            browser.close()
-            
-        def normalizar_nombre(texto: str) -> str:
-            texto = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
-            texto = texto.strip().replace(" ", "_")
-            return re.sub(r'[^a-zA-Z0-9_\-]', '', texto)
 
-        razon_limpia = normalizar_nombre(req.razon_social or "Cliente")
-        sucursal_limpia = normalizar_nombre(req.agencia_sucursal or "General")
-        filename_final = f"Referencias_{razon_limpia}_{sucursal_limpia}.pdf"
-            
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename_final}",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
+        return FileResponse(
+            path=target_path, 
+            filename=os.path.basename(target_path)
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f">>> [ERROR GENERATE-PDF]: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error en el microservicio al renderizar el PDF con Playwright: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error al descargar archivo: {str(e)}")
 
-
-@app.post("/optimizar_pdf", response_class=Response)
-async def optimizar_pdf(req: OptimizePDFReq):
-    try:
-        raw_bytes = base64.b64decode(req.file_b64)
-        reader = PdfReader(BytesIO(raw_bytes))
-        writer = PdfWriter()
-
-        print(f"\n>>> [OPTIMIZADOR DEFINITIVO] Analizando imágenes de {len(reader.pages)} páginas...")
-
-        for page in reader.pages:
-            page_optimized = False
-            
-            if page.images:
-                for image_file_object in page.images:
-                    try:
-                        image_bytes = image_file_object.data
-                        img = Image.open(BytesIO(image_bytes))
-                        
-                        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-                            background = Image.new("RGB", img.size, (255, 255, 255))
-                            if img.mode == "P":
-                                img = img.convert("RGBA")
-                            background.paste(img, mask=img.split()[-1])
-                            img = background
-                        elif img.mode in ("CMYK", "1", "L"):
-                            img = img.convert("RGB")
-                        else:
-                            img = img.convert("RGB")
-                        
-                        max_pixel_dim = 1200
-                        if img.width > max_pixel_dim or img.height > max_pixel_dim:
-                            img.thumbnail((max_pixel_dim, max_pixel_dim), Image.Resampling.LANCZOS)
-                        
-                        compressed_img_buffer = BytesIO()
-                        img.save(compressed_img_buffer, format="JPEG", quality=50, optimize=True)
-                        compressed_img_buffer.seek(0)
-                        
-                        page_buffer = BytesIO()
-                        canvas_page = canvas.Canvas(page_buffer, pagesize=(612, 792))
-                        
-                        img_reader = ImageReader(compressed_img_buffer)
-                        canvas_page.drawImage(img_reader, 0, 0, width=612, height=792, preserveAspectRatio=True)
-                        canvas_page.showPage()
-                        canvas_page.save()
-                        page_buffer.seek(0)
-                        
-                        pdf_page_reader = PdfReader(page_buffer)
-                        writer.add_page(pdf_page_reader.pages[0])
-                        page_optimized = True
-                        break  
-                        
-                    except Exception as img_err:
-                        print(f"--> Aviso: Error en decodificación de imagen: {str(img_err)}")
-                        continue
-            
-            if not page_optimized:
-                page.scale_to(612, 792)
-                writer.add_page(page)
-
-        pdf_data = _export(writer)
-
-        nombre_original = req.file_name or "ine_optimizada.pdf"
-        nombre_seguro = "".join(
-            c for c in unicodedata.normalize("NFD", nombre_original)
-            if unicodedata.category(c) != "Mn"
-        )
-        nombre_seguro = "".join(c for c in nombre_seguro if ord(c) < 128)
-        nombre_seguro = re.sub(r'[^a-zA-Z0-9_\.-]', '_', nombre_seguro)
-        
-        if not nombre_seguro:
-            nombre_seguro = "ine_optimizada.pdf"
-
-        print(f">>> [OPTIMIZADOR] ¡Éxito! Enviando archivo binario corregido: {nombre_seguro}")
-        
-        return Response(
-            content=pdf_data,
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename={nombre_seguro}",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
-
-    except Exception as e:
-        print(f">>> [ERROR OPTIMIZADOR]: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error al procesar el PDF: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
