@@ -17,6 +17,7 @@ INSTRUCCIONES PERMANENTES PARA IA / GEMINI (DIRECTIVAS DE EDICIÓN QUIRÚRGICA)
 """
 
 from fastapi import FastAPI, Response, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -50,10 +51,10 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.70 - Fusión Completa (Rotación + Nombres Dinámicos + Endpoints Doosan/PDF)"
+VERSION = "1.80 - Fusión Completa (Descarga de Archivos de Almacenamiento Local + Endpoints Doosan/PDF)"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Integración Completa v1.60 + v1.70)")
+print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80)")
 print(f"{'='*40}\n")
 
 # =========================================================
@@ -877,6 +878,7 @@ def validate_reference_request(req: ReferenceParseReq):
                 id_tipo = "CURP"
                 id_valor = curp_lenient.group(0)
             else:
+                # ESTADO: RECHAZADO (Sin ID válido)
                 return {
                     "status": "rejected",
                     "reason": "No se localizó un identificador legible. Asegúrese de escribir de forma clara su Número de Cliente, RFC o CURP."
@@ -939,12 +941,18 @@ def validate_reference_request(req: ReferenceParseReq):
     if not sucursal_encontrada and cuerpo:
         sucursal_encontrada = obtener_primera_coincidencia(cuerpo)
 
+    # NUEVO ESTADO: IDCliente (ID válido, pero sin sucursal)
     if not sucursal_encontrada:
         return {
-            "status": "rejected",
-            "reason": f"Identificador extraído ({id_tipo}: {id_valor} — {structure_status}), pero no se detectó una sucursal operativa en el correo."
+            "status": "IDCliente",
+            "search_by": id_tipo,
+            "search_value": id_valor,
+            "branch": "GENERAL",
+            "structure_status": structure_status,
+            "reason": "No se introdujo Sucursal, te muestro las referencias que tiene activas el cliente."
         }
 
+    # ESTADO: APROBADO (ID válido y sucursal encontrada)
     return {
         "status": "approved",
         "search_by": id_tipo,
@@ -952,6 +960,40 @@ def validate_reference_request(req: ReferenceParseReq):
         "branch": sucursal_encontrada,
         "structure_status": structure_status
     }
+
+# --- ENDPOINT 15: DESCARGAR ARCHIVO LOCAL/ALMACENAMIENTO (NUEVO) ---
+@app.get("/descargar_archivo/{filepath:path}")
+async def descargar_archivo(filepath: str):
+    """
+    Descarga cualquier archivo almacenado en el microservicio o sus volúmenes.
+    Ejemplo de llamada: GET /descargar_archivo/archivos/mi_documento.pdf
+    O: GET /descargar_archivo/logo_vegusa.png
+    """
+    try:
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        target_path = os.path.abspath(os.path.join(base_dir, filepath))
+
+        # Validación anti-Directory Traversal (Evita acceder fuera del contenedor/app)
+        if not target_path.startswith(base_dir):
+            raise HTTPException(
+                status_code=400, 
+                detail="Acceso denegado: Intento de acceso a una ruta fuera del directorio permitido."
+            )
+
+        if not os.path.exists(target_path) or not os.path.isfile(target_path):
+            raise HTTPException(
+                status_code=404, 
+                detail=f"El archivo '{filepath}' no existe o no se encuentra disponible."
+            )
+
+        return FileResponse(
+            path=target_path, 
+            filename=os.path.basename(target_path)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al descargar archivo: {str(e)}")
 
 
 if __name__ == "__main__":
