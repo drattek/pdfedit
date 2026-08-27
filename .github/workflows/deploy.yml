@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  RESOURCE_GROUP: n8n
+  RESOURCE_GROUP: autos
   APP_NAME: pdfedit
   ACR_NAME: pdfeditacr
   IMAGE_REPO: pdfedit
