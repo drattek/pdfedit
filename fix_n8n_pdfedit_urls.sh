@@ -1,63 +1,65 @@
 #!/usr/bin/env bash
 # Reemplaza en los workflows de n8n (Postgres) la URL pública vieja de pdfedit
-# por la interna http://pdfedit. Hace respaldo antes de tocar nada.
-# Uso: ./fix_n8n_pdfedit_urls.sh          # aplica
+# por la interna http://pdfedit. Corre psql desde un contenedor efímero en Azure
+# (ACI) porque el puerto 5432 no es alcanzable desde la red local.
+# Uso: ./fix_n8n_pdfedit_urls.sh            # aplica
 #      DRY_RUN=1 ./fix_n8n_pdfedit_urls.sh  # solo muestra
 set -euo pipefail
 
-PG_RG=n8n; PG_SERVER=n8ndbikvy6n; PG_DB=n8n; PG_USER=n8nadmin
+PG_SERVER=n8ndbikvy6n; PG_DB=n8n; PG_USER=n8nadmin
 OLD_HOST='pdfedit.thankfulsky-cf68888c.eastus.azurecontainerapps.io'
 NEW_URL='http://pdfedit'
-RULE=tmp-fix-n8n-urls
-MYIP=$(curl -s ifconfig.me)
+ACI_RG=autos; ACI_NAME=n8nfix-$RANDOM; ACI_LOC=westus3
 
-export PGPASSWORD
-PGPASSWORD=$(az containerapp show -n n8n -g autos \
+PGPASS=$(az containerapp show -n n8n -g autos \
   --query "properties.template.containers[0].env[?name=='DB_POSTGRESDB_PASSWORD'].value | [0]" -o tsv)
-CONN="host=$PG_SERVER.postgres.database.azure.com dbname=$PG_DB user=$PG_USER sslmode=require"
 
-cleanup() { az postgres flexible-server firewall-rule delete -g $PG_RG -n $PG_SERVER -r $RULE -y -o none 2>/dev/null || true; }
-trap cleanup EXIT
-echo "==> Abriendo firewall Postgres para $MYIP (temporal)"
-az postgres flexible-server firewall-rule create -g $PG_RG -n $PG_SERVER -r $RULE \
-  --start-ip-address "$MYIP" --end-ip-address "$MYIP" -o none
-sleep 5
-
-echo "==> Respaldo de workflows -> n8n_workflows_backup.sql"
-pg_dump "$CONN" -t workflow_entity --data-only --column-inserts > n8n_workflows_backup.sql
-echo "   $(wc -l < n8n_workflows_backup.sql) líneas"
-
-echo "==> Workflows que referencian a pdfedit:"
-psql "$CONN" -c "
+SQL_SHOW="
+SELECT '== Workflows que mencionan pdfedit' AS paso;
 SELECT id, name, active,
-       (nodes::text LIKE '%$OLD_HOST%')  AS url_vieja,
-       (nodes::text LIKE '%http://pdfedit%') AS url_interna,
-       (nodes::text ILIKE '%pdfedit%')   AS menciona
-FROM workflow_entity
-WHERE nodes::text ILIKE '%pdfedit%'
-ORDER BY name;"
-
-echo "==> URLs exactas encontradas:"
-psql "$CONN" -Atc "
+       (nodes::text LIKE '%thankfulsky-cf68888c%') AS url_vieja,
+       (nodes::text LIKE '%http://pdfedit%')  AS url_interna
+FROM workflow_entity WHERE nodes::text ILIKE '%pdfedit%' ORDER BY name;
+SELECT '== URLs exactas' AS paso;
 SELECT DISTINCT m[1] FROM workflow_entity,
-  regexp_matches(nodes::text, 'https?://[A-Za-z0-9.:_-]*pdfedit[A-Za-z0-9.:_/-]*', 'g') AS m;"
-
-if [ "${DRY_RUN:-0}" = "1" ]; then echo "(DRY_RUN: no se aplican cambios)"; exit 0; fi
-
-echo "==> Aplicando reemplazos"
-psql "$CONN" -c "
+  regexp_matches(nodes::text, 'https?://[A-Za-z0-9.:_-]*pdfedit[A-Za-z0-9.:_/-]*', 'g') AS m;
+SELECT '== Credenciales que mencionan pdfedit (nombre)' AS paso;
+SELECT id, name, type FROM credentials_entity WHERE name ILIKE '%pdfedit%';
+"
+SQL_FIX="
+SELECT '== Respaldo en tabla workflow_entity_bak_pdfedit' AS paso;
+CREATE TABLE IF NOT EXISTS workflow_entity_bak_pdfedit AS SELECT * FROM workflow_entity;
+SELECT '== Aplicando reemplazos' AS paso;
 UPDATE workflow_entity
-SET nodes = replace(replace(replace(nodes::text,
-      'https://$OLD_HOST', '$NEW_URL'),
-      'http://$OLD_HOST',  '$NEW_URL'),
-      'http://pdfedit:8000', '$NEW_URL')::json,
+SET nodes = regexp_replace(nodes::text,
+      'https?://pdfedit(\\.internal)?\\.thankfulsky-cf68888c\\.eastus\\.azurecontainerapps\\.io(:[0-9]+)?|http://pdfedit:8000',
+      '$NEW_URL', 'g')::json,
     \"updatedAt\" = now()
-WHERE nodes::text LIKE '%$OLD_HOST%' OR nodes::text LIKE '%http://pdfedit:8000%';"
+WHERE nodes::text LIKE '%thankfulsky-cf68888c%' OR nodes::text LIKE '%http://pdfedit:8000%';
+SELECT '== Verificación (debe quedar vacío)' AS paso;
+SELECT id, name FROM workflow_entity WHERE nodes::text LIKE '%thankfulsky-cf68888c%';
+"
+SQL="$SQL_SHOW"; [ "${DRY_RUN:-0}" = "1" ] || SQL="$SQL_SHOW$SQL_FIX"
 
-echo "==> Verificación (debe quedar vacío):"
-psql "$CONN" -Atc "SELECT id, name FROM workflow_entity WHERE nodes::text LIKE '%$OLD_HOST%';"
+echo "==> Ejecutando psql en ACI $ACI_NAME ($ACI_LOC)"
+az container create -g $ACI_RG -n $ACI_NAME -l $ACI_LOC --os-type Linux \
+  --image postgres:16-alpine --cpu 1 --memory 1 --restart-policy Never \
+  --secure-environment-variables PGPASSWORD="$PGPASS" \
+  --environment-variables PGHOST=$PG_SERVER.postgres.database.azure.com PGDATABASE=$PG_DB PGUSER=$PG_USER PGSSLMODE=require \
+  --command-line "psql -v ON_ERROR_STOP=1 -c \"$(echo "$SQL" | tr '\n' ' ' | sed 's/"/\\"/g')\"" -o none
 
-echo "==> Reiniciando n8n para que recargue los workflows activos"
-az containerapp revision restart -n n8n -g autos \
-  --revision "$(az containerapp revision list -n n8n -g autos --query '[?properties.active].name | [0]' -o tsv)" -o none
-echo "Listo."
+for i in $(seq 1 40); do
+  ST=$(az container show -g $ACI_RG -n $ACI_NAME --query 'instanceView.state' -o tsv 2>/dev/null || echo "")
+  [ "$ST" = "Succeeded" ] || [ "$ST" = "Failed" ] || [ "$ST" = "Terminated" ] && break
+  sleep 5
+done
+echo "==> Estado ACI: $ST"
+az container logs -g $ACI_RG -n $ACI_NAME
+az container delete -g $ACI_RG -n $ACI_NAME --yes -o none
+
+if [ "${DRY_RUN:-0}" != "1" ]; then
+  echo "==> Reiniciando n8n para recargar workflows activos"
+  REV=$(az containerapp revision list -n n8n -g autos --query '[?properties.active].name | [0]' -o tsv)
+  az containerapp revision restart -n n8n -g autos --revision "$REV" -o none
+  echo "Listo."
+fi
