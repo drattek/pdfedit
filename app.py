@@ -51,7 +51,7 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.80 - Fusión Completa (Descarga de Archivos de Almacenamiento Local + Endpoints Doosan/PDF)"
+VERSION = "1.90 - Fusión Completa (Descarga de Archivos de Almacenamiento Local + Endpoints Doosan/PDF)"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80)")
