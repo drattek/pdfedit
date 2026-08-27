@@ -57,3 +57,54 @@ docker run -p 8000:8000 pdf-edit-service
 - Empieza con áreas **más grandes** para cubrir el bloque completo y luego ajusta.
 - Si la factura tiene más de una página, `page` empieza en 0 (portada = 0).
 - Si necesitas fuentes distintas o tamaño mayor, modifica `font_size` y `leading` en `app.py`.
+
+## Deploy automático a Azure Container Apps
+
+Cada `git push` a la rama `main` dispara el workflow de GitHub Actions
+`.github/workflows/deploy.yml`, que despliega la app **pdfedit** en Azure Container Apps
+(grupo de recursos `n8n`). También se puede lanzar manualmente desde la pestaña
+**Actions → Deploy pdfedit a Azure Container Apps → Run workflow**.
+
+### Qué hace el pipeline
+
+1. **Login a Azure por OIDC** (`azure/login@v2`) — sin contraseñas guardadas; GitHub intercambia
+   un token federado por la identidad `pdfedit-github-actions` de Entra ID.
+2. **Build de la imagen en ACR**: `az acr build` en el registro `pdfeditacr`, con dos tags:
+   el SHA corto del commit (ej. `pdfedit:a30bc673`) y `latest`.
+3. **Nueva revisión en Container Apps**: `az containerapp update --image ... --revision-suffix sha-<sha>`.
+   La revisión anterior se conserva con 0% de tráfico, por si hay que regresar.
+4. **Verificación**: imprime la URL pública y la tabla de revisiones activas.
+
+Cambios que solo tocan archivos `.md`, `deploy_n8n_aca.py`, `Dockerfile.n8n` o `n8n_outlook/`
+**no** disparan el deploy.
+
+### Configuración necesaria (ya hecha)
+
+| Dónde | Qué |
+|---|---|
+| Entra ID | App registration `pdfedit-github-actions` con rol **Contributor** sobre el RG `n8n` |
+| Entra ID | Credencial federada: issuer `token.actions.githubusercontent.com`, subject `repo:drattek/pdfedit:ref:refs/heads/main` |
+| GitHub Secrets | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` |
+
+Si se cambia el nombre del repo o de la rama, hay que actualizar el `subject` de la credencial federada.
+
+### Seguir el deploy
+
+```bash
+gh run list -L 5          # últimos runs
+gh run watch              # seguir el run en curso
+az containerapp revision list -n pdfedit -g n8n -o table
+```
+
+### Regresar a una revisión anterior
+
+```bash
+az containerapp ingress traffic set -n pdfedit -g n8n \
+  --revision-weight pdfedit--sha-<sha-anterior>=100
+```
+
+### Cambios de infraestructura
+
+El pipeline solo construye la imagen y publica una revisión. Para crear/rotar secretos,
+cambiar CPU/memoria, inicializar la base de datos, etc., sigue usándose el script
+`deploy_pdfedit_aca.py` de forma manual (`python deploy_pdfedit_aca.py --help`).
