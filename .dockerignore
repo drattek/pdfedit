@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+.env
+.env.*
+venv
+.venv
+__pycache__
+*.pyc
+*.zip
+deploy_*.py
+validate_aca_connectivity.py
+Dockerfile.n8n
+n8n_outlook
