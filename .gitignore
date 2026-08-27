@@ -21,3 +21,4 @@ Thumbs.db
 
 # Archivo vacio suelto
 /docker
+n8n_workflows_backup.sql
