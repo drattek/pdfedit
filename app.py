@@ -51,7 +51,7 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.91 - Fusión Completa (Descarga de Archivos de Almacenamiento Local + Endpoints Doosan/PDF)"
+VERSION = "1.82 - Correccion busqueda sucursal"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80)")
@@ -557,7 +557,7 @@ def generate_word(req: WordRequest):
         p_disc.paragraph_format.space_before = Pt(25)
         p_disc.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda estrictamente prohibida la divulgación o difusión de este archivo fuera de la empresa.")
+        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda strictly prohibida la divulgación o difusión de este archivo fuera de la empresa.")
         run_disc.font.size = Pt(8.5)
         run_disc.font.italic = True
         run_disc.font.bold = True
@@ -856,10 +856,8 @@ def validate_reference_request(req: ReferenceParseReq):
         id_tipo = "CURP"
         id_valor = re.sub(r'[\s\-]', '', curp_prefix.group(1))
     else:
-        if not curp_prefix:
-            curp_prefix = re.search(r'\bCURP\s*[:\-\s]*([A-Z0-9]{18})\b', texto_completo)
-        if not rfc_prefix:
-            rfc_prefix = re.search(r'\bRFC\s*[:\-\s]*([A-Z0-9]{12,13})\b', texto_completo)
+        curp_prefix = re.search(r'\bCURP\s*[:\-\s]*([A-Z0-9]{18})\b', texto_completo)
+        rfc_prefix = re.search(r'\bRFC\s*[:\-\s]*([A-Z0-9]{12,13})\b', texto_completo)
 
         if rfc_prefix:
             id_tipo = "RFC"
@@ -877,26 +875,23 @@ def validate_reference_request(req: ReferenceParseReq):
             elif curp_lenient:
                 id_tipo = "CURP"
                 id_valor = curp_lenient.group(0)
-            else:
-                # ESTADO: RECHAZADO (Sin ID válido)
-                return {
-                    "status": "rejected",
-                    "reason": "No se localizó un identificador legible. Asegúrese de escribir de forma clara su Número de Cliente, RFC o CURP."
-                }
 
-    RFC_STRICT = r'^[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{3}$'
-    CURP_STRICT = r'^[A-Z][AEIOUX][A-Z]{2}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM][A-Z]{2}[B-DF-HJ-NP-TV-XYZ]{3}[0-9A-Z][0-9]$'
-    CLIENTE_STRICT = r'^[0-9]{4,6}$'
+    if id_tipo:
+        RFC_STRICT = r'^[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{3}$'
+        CURP_STRICT = r'^[A-Z][AEIOUX][A-Z]{2}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM][A-Z]{2}[B-DF-HJ-NP-TV-XYZ]{3}[0-9A-Z][0-9]$'
+        CLIENTE_STRICT = r'^[0-9]{4,6}$'
 
-    is_valid = False
-    if id_tipo == "NUMERO_CLIENTE":
-        is_valid = bool(re.match(CLIENTE_STRICT, id_valor))
-    elif id_tipo == "RFC":
-        is_valid = bool(re.match(RFC_STRICT, id_valor))
-    elif id_tipo == "CURP":
-        is_valid = bool(re.match(CURP_STRICT, id_valor))
+        is_valid = False
+        if id_tipo == "NUMERO_CLIENTE":
+            is_valid = bool(re.match(CLIENTE_STRICT, id_valor))
+        elif id_tipo == "RFC":
+            is_valid = bool(re.match(RFC_STRICT, id_valor))
+        elif id_tipo == "CURP":
+            is_valid = bool(re.match(CURP_STRICT, id_valor))
 
-    structure_status = "Válida" if is_valid else "Estructura no válida"
+        structure_status = "Válida" if is_valid else "Estructura no válida"
+    else:
+        structure_status = "No encontrado"
 
     mapeo_sucursales = {
         "Villas": [r"\bVILLAS?\b", r"\b331\b"],
@@ -941,7 +936,18 @@ def validate_reference_request(req: ReferenceParseReq):
     if not sucursal_encontrada and cuerpo:
         sucursal_encontrada = obtener_primera_coincidencia(cuerpo)
 
-    # NUEVO ESTADO: IDCliente (ID válido, pero sin sucursal)
+    branch_result = sucursal_encontrada if sucursal_encontrada else "GENERAL"
+
+    if not id_tipo:
+        return {
+            "status": "rejected",
+            "search_by": None,
+            "search_value": None,
+            "branch": branch_result,
+            "structure_status": structure_status,
+            "reason": "No se localizó un identificador legible. Asegúrese de escribir de forma clara su Número de Cliente, RFC o CURP."
+        }
+
     if not sucursal_encontrada:
         return {
             "status": "IDCliente",
@@ -952,7 +958,6 @@ def validate_reference_request(req: ReferenceParseReq):
             "reason": "No se introdujo Sucursal, te muestro las referencias que tiene activas el cliente."
         }
 
-    # ESTADO: APROBADO (ID válido y sucursal encontrada)
     return {
         "status": "approved",
         "search_by": id_tipo,
