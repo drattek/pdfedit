@@ -52,10 +52,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.85 - Fusion Fix Garbage Collection + Plantillas Responsiva DOCX"
+VERSION = "1.86 - Migracion de Overlays y Edicion PDF a PyMuPDF (fitz)"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + Fix Overlays + Responsivas)")
+print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + PyMuPDF Engine)")
 print(f"{'='*40}\n")
 
 # =========================================================
@@ -229,7 +229,7 @@ class ResponsivaReq(BaseModel):
 
 
 # ---------------------------------------------------------
-# UTILIDADES INTERNAS PDF Y DOOSAN
+# UTILIDADES INTERNAS PDF (PyMuPDF / fitz Engine)
 # ---------------------------------------------------------
 
 def _load_pdf_from_b64(file_b64: str) -> PdfReader:
@@ -241,71 +241,52 @@ def _export(writer: PdfWriter) -> bytes:
     writer.write(out)
     return out.getvalue()
 
-def _make_overlay(page_width: float, page_height: float, draw_ops):
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=(page_width, page_height))
-    draw_ops(c)
-    c.showPage()
-    c.save()
-    buf.seek(0)
-    return buf
-
-def _overlay_rect_with_text(
-    reader: PdfReader,
-    writer: PdfWriter,
+def _overlay_rect_with_text_fitz(
+    pdf_bytes: bytes,
     rect: Rect,
     text: str,
-    font_name: str = "Helvetica",
     font_size: float = 9.0,
     leading: float = 11.0,
     debug_outline: bool = False
-):
-    page_index = max(0, min(rect.page, len(reader.pages) - 1))
-    page = reader.pages[page_index]
-    media = page.mediabox
-    pw, ph = float(media.width), float(media.height)
+) -> bytes:
+    """
+    Renderiza texto superpuesto directamente usando PyMuPDF (fitz) para garantizar 
+    compatibilidad del 100% con Aspose.Words, grupos de transparencia y fuentes embebidas.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_index = max(0, min(rect.page, len(doc) - 1))
+    page = doc.load_page(page_index)
 
-    def draw_ops(c):
-        if debug_outline:
-            c.setStrokeColorRGB(1, 0, 0)
-            c.setLineWidth(1.2)
-            c.rect(rect.x, rect.y, rect.w, rect.h, fill=False, stroke=True)
-            return
-        c.setFillColor(white)
-        c.rect(rect.x, rect.y, rect.w, rect.h, fill=True, stroke=False)
-        c.setFillColor(black)
-        c.setFont(font_name, font_size)
-        x, y = rect.x + 2, rect.y + rect.h - leading
-        max_w = rect.w - 4
-        
-        for line in (text or '').split("\n"):
-            words = line.split(" ")
-            cur = ""
-            for w in words:
-                test = (cur + " " + w).strip() if cur else w
-                if stringWidth(test, font_name, font_size) <= max_w:
-                    cur = test
-                else:
-                    c.drawString(x, y, cur)
-                    y -= leading
-                    cur = w
-                    if y < rect.y + 2: return
-            if y >= rect.y + 2:
-                c.drawString(x, y, cur)
-                y -= leading
+    # Conversión de coordenadas (PyMuPDF usa origen superior-izquierdo, ReportLab inferior-izquierdo)
+    page_height = page.rect.height
+    fitz_rect = fitz.Rect(
+        rect.x, 
+        page_height - rect.y - rect.h, 
+        rect.x + rect.w, 
+        page_height - rect.y
+    )
 
-    # --- PREVENCIÓN DE GARBAGE COLLECTION EN BÚFERES TEMPORALES ---
-    overlay_buf = _make_overlay(pw, ph, draw_ops)
-    overlay_reader = PdfReader(overlay_buf)
-    page.merge_page(overlay_reader.pages[0])
+    if debug_outline:
+        page.draw_rect(fitz_rect, color=(1, 0, 0), width=1)
+    else:
+        # Dibujar rectángulo blanco para cubrir el texto original
+        page.draw_rect(fitz_rect, color=(1, 1, 1), fill=(1, 1, 1))
 
-    if not hasattr(writer, "_overlay_buffers"):
-        writer._overlay_buffers = []
-    writer._overlay_buffers.append(overlay_buf)
-    writer._overlay_buffers.append(overlay_reader)
+        # Insertar texto dentro de la caja delimitadora
+        fname = "helv"
+        page.insert_textbox(
+            fitz_rect,
+            text or "",
+            fontsize=font_size,
+            fontname=fname,
+            color=(0, 0, 0),
+            align=0  # Alineación izquierda
+        )
 
-    for i, p in enumerate(reader.pages):
-        writer.add_page(page if i == page_index else p)
+    out_buf = BytesIO()
+    doc.save(out_buf)
+    doc.close()
+    return out_buf.getvalue()
 
 
 class AuthException(Exception):
@@ -375,7 +356,7 @@ def _doosan_navigate_to_results(context, user, password, f_start, f_end):
 # ENDPOINTS DE LA API
 # ---------------------------------------------------------
 
-# --- ENDPOINT 1: EXTRAER ROSTRO (Versión 1.70 - Rotación Corregida) ---
+# --- ENDPOINT 1: EXTRAER ROSTRO ---
 @app.post("/extraer_rostro")
 async def extraer_rostro(req: ExtractFaceReq):
     try:
@@ -466,7 +447,7 @@ async def extraer_rostro(req: ExtractFaceReq):
         return {"status": "error", "message": str(e), "rostro_b64": None}
 
 
-# --- ENDPOINT 2: GENERAR PDF (Versión 1.70 - Nombres Dinámicos) ---
+# --- ENDPOINT 2: GENERAR PDF ---
 @app.post("/generate-pdf", response_class=Response)
 def generate_pdf(req: PDFRequest):
     try:
@@ -517,7 +498,7 @@ def generate_pdf(req: PDFRequest):
         )
 
 
-# --- ENDPOINT 3: GENERAR WORD (Versión 1.70 - Nombres Dinámicos) ---
+# --- ENDPOINT 3: GENERAR WORD ---
 @app.post("/generate-word", response_class=Response)
 def generate_word(req: WordRequest):
     try:
@@ -786,95 +767,152 @@ async def find_text_coords(req: CoordinateRequest):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ENDPOINT 9: EDIT INCOTERM ---
+# --- ENDPOINT 9: EDIT INCOTERM (MOTOR FITZ / PYMUPDF) ---
 @app.post("/edit_incoterm", response_class=Response)
 async def edit_incoterm(req: IncotermReq):
     try:
-        reader = _load_pdf_from_b64(req.file_b64)
-        writer = PdfWriter()
+        raw_bytes = base64.b64decode(req.file_b64)
         if req.incoterm_change and req.area:
-            _overlay_rect_with_text(
-                reader, 
-                writer, 
-                req.area, 
-                req.incoterm_text, 
-                font_size=req.font_size, 
-                leading=req.leading, 
-                debug_outline=req.debug_outline
+            final_pdf = _overlay_rect_with_text_fitz(
+                raw_bytes,
+                req.area,
+                req.incoterm_text,
+                font_size=req.font_size or 7.0,
+                leading=req.leading or 9.0,
+                debug_outline=req.debug_outline or False
             )
         else:
-            for p in reader.pages: 
-                writer.add_page(p)
-        return Response(content=_export(writer), media_type="application/pdf")
+            final_pdf = raw_bytes
+
+        return Response(content=final_pdf, media_type="application/pdf")
     except Exception as e:
-        print(f">>> [ERROR EDIT_INCOTERM]: {str(e)}")
+        print(f">>> [ERROR EDIT_INCOTERM FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en edit_incoterm: {str(e)}")
 
 
-# --- ENDPOINT 10: EDIT BILLSHIP ---
+# --- ENDPOINT 10: EDIT BILLSHIP (MOTOR FITZ / PYMUPDF) ---
 @app.post("/edit_billship", response_class=Response)
 async def edit_billship(req: BillShipReq):
     try:
-        reader = _load_pdf_from_b64(req.file_b64)
-        writer = PdfWriter()
+        pdf_bytes = base64.b64decode(req.file_b64)
         bill_area = req.bill_to_area or Rect(page=0, x=72, y=560, w=220, h=80)
         ship_area = req.ship_to_area or Rect(page=0, x=300, y=560, w=250, h=80)
-        
+
         if req.bill_to_text and req.bill_to_area:
-            _overlay_rect_with_text(reader, writer, bill_area, req.bill_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
+            pdf_bytes = _overlay_rect_with_text_fitz(
+                pdf_bytes, 
+                bill_area, 
+                req.bill_to_text, 
+                font_size=req.font_size or 7.0,
+                debug_outline=req.debug_outline or False
+            )
         if req.ship_to_text and req.ship_to_area:
-            _overlay_rect_with_text(reader, writer, ship_area, req.ship_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
-            
-        if not writer.pages:
-            for p in reader.pages: 
-                writer.add_page(p)
-            
-        return Response(content=_export(writer), media_type="application/pdf")
+            pdf_bytes = _overlay_rect_with_text_fitz(
+                pdf_bytes, 
+                ship_area, 
+                req.ship_to_text, 
+                font_size=req.font_size or 7.0,
+                debug_outline=req.debug_outline or False
+            )
+
+        return Response(content=pdf_bytes, media_type="application/pdf")
     except Exception as e:
-        print(f">>> [ERROR EDIT_BILLSHIP]: {str(e)}")
+        print(f">>> [ERROR EDIT_BILLSHIP FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en edit_billship: {str(e)}")
 
 
-# --- ENDPOINT 11: OVERLAY TEXT BATCH ---
+# --- ENDPOINT 11: OVERLAY TEXT BATCH (MOTOR FITZ / PYMUPDF) ---
 @app.post("/overlay_text_batch", response_class=Response)
 async def overlay_text_batch(req: CustomBatchReq):
-    reader = _load_pdf_from_b64(req.file_b64)
-    if not req.ops:
-        w = PdfWriter()
-        for p in reader.pages: w.add_page(p)
-        return Response(content=_export(w), media_type="application/pdf")
-    for op in req.ops:
-        w = PdfWriter()
-        _overlay_rect_with_text(reader, w, op.area, op.text, font_name=(op.font_name or "Helvetica"), font_size=op.font_size or 9.0, leading=op.leading or 11.0, debug_outline=op.debug_outline or False)
-        reader = PdfReader(BytesIO(_export(w)))
-    final_writer = PdfWriter()
-    for p in reader.pages: final_writer.add_page(p)
-    return Response(content=_export(final_writer), media_type="application/pdf")
+    try:
+        pdf_bytes = base64.b64decode(req.file_b64)
+        if not req.ops:
+            return Response(content=pdf_bytes, media_type="application/pdf")
+        
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for op in req.ops:
+            page_index = max(0, min(op.area.page, len(doc) - 1))
+            page = doc.load_page(page_index)
+            page_height = page.rect.height
+            
+            fitz_rect = fitz.Rect(
+                op.area.x,
+                page_height - op.area.y - op.area.h,
+                op.area.x + op.area.w,
+                page_height - op.area.y
+            )
+            
+            if op.debug_outline:
+                page.draw_rect(fitz_rect, color=(1, 0, 0), width=1)
+            else:
+                page.draw_rect(fitz_rect, color=(1, 1, 1), fill=(1, 1, 1))
+                
+                fname = "helv"
+                if "bold" in (op.font_name or "").lower():
+                    fname = "hebo"
+                    
+                page.insert_textbox(
+                    fitz_rect,
+                    op.text or "",
+                    fontsize=op.font_size or 9.0,
+                    fontname=fname,
+                    color=(0, 0, 0),
+                    align=0
+                )
+                
+        out_buf = BytesIO()
+        doc.save(out_buf)
+        doc.close()
+        return Response(content=out_buf.getvalue(), media_type="application/pdf")
+    except Exception as e:
+        print(f">>> [ERROR OVERLAY_TEXT_BATCH FITZ]: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
-# --- ENDPOINT 12: CUT RANGE ---
+# --- ENDPOINT 12: CUT RANGE (MOTOR FITZ / PYMUPDF) ---
 @app.post("/cut_range", response_class=Response)
 async def cut_range(req: CutRangeReq):
-    reader = _load_pdf_from_b64(req.file_b64)
-    writer = PdfWriter()
-    total = len(reader.pages)
-    start = max(0, min(req.start_page, total - 1))
-    end = max(start, min(req.final_page, total - 1))
-    for i in range(start, end + 1):
-        writer.add_page(reader.pages[i])
-    return Response(content=_export(writer), media_type="application/pdf")
+    try:
+        raw_bytes = base64.b64decode(req.file_b64)
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+        total = len(doc)
+        start = max(0, min(req.start_page, total - 1))
+        end = max(start, min(req.final_page, total - 1))
+        
+        doc_out = fitz.open()
+        doc_out.insert_pdf(doc, from_page=start, to_page=end)
+        
+        out_buf = BytesIO()
+        doc_out.save(out_buf)
+        doc.close()
+        doc_out.close()
+        return Response(content=out_buf.getvalue(), media_type="application/pdf")
+    except Exception as e:
+        print(f">>> [ERROR CUT_RANGE FITZ]: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en cut_range: {str(e)}")
 
 
 # --- ENDPOINT 13: EXTRACT CUSTOM PAGES ---
 @app.post("/extract_custom_pages", response_class=Response)
 async def extract_custom_pages(req: CustomPagesReq):
-    reader = _load_pdf_from_b64(req.file_b64)
-    writer = PdfWriter()
-    total = len(reader.pages)
-    for p_num in req.pages:
-        if 0 <= p_num < total:
-            writer.add_page(reader.pages[p_num])
-    return Response(content=_export(writer), media_type="application/pdf")
+    try:
+        raw_bytes = base64.b64decode(req.file_b64)
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+        total = len(doc)
+        
+        doc_out = fitz.open()
+        for p_num in req.pages:
+            if 0 <= p_num < total:
+                doc_out.insert_pdf(doc, from_page=p_num, to_page=p_num)
+                
+        out_buf = BytesIO()
+        doc_out.save(out_buf)
+        doc.close()
+        doc_out.close()
+        return Response(content=out_buf.getvalue(), media_type="application/pdf")
+    except Exception as e:
+        print(f">>> [ERROR EXTRACT_CUSTOM_PAGES FITZ]: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en extract_custom_pages: {str(e)}")
 
 
 # --- ENDPOINT 14: VALIDATE REFERENCE REQUEST ---
