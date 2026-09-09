@@ -11,3 +11,4 @@ opencv-python-headless
 mediapipe
 PyMuPDF
 python-docx
+docxtpl
