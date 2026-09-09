@@ -45,16 +45,17 @@ import cv2
 import fitz  # PyMuPDF
 import numpy as np
 
-# --- GENERADOR DE DOCUMENTOS WORD ---
+# --- GENERADOR DE DOCUMENTOS WORD Y PLANTILLAS ---
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.82 - Correccion busqueda sucursal"
+VERSION = "1.85 - Fusion Fix Garbage Collection + Plantillas Responsiva DOCX"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80)")
+print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + Fix Overlays + Responsivas)")
 print(f"{'='*40}\n")
 
 # =========================================================
@@ -201,6 +202,31 @@ class WordRequest(BaseModel):
     remitente_name: Optional[str] = "Cliente"
     prefijo: Optional[str] = "Identificacion"
 
+class ResponsivaReq(BaseModel):
+    tipo_plantilla: str  # "laptop" o "celular"
+    numero_ticket: Optional[str] = ""
+    nombre_completo: Optional[str] = ""
+    puesto: Optional[str] = ""
+    departamento: Optional[str] = ""
+    unidad_negocio: Optional[str] = ""
+    sucursal: Optional[str] = ""
+    correo: Optional[str] = ""
+    fecha_ingreso: Optional[str] = ""
+    extension: Optional[str] = ""
+    
+    # Variables de Laptop
+    marca: Optional[str] = ""
+    modelo: Optional[str] = ""
+    procesador: Optional[str] = ""
+    serie: Optional[str] = ""
+    
+    # Variables de Celular
+    marca_mov: Optional[str] = ""
+    modelo_mov: Optional[str] = ""
+    IMEI: Optional[str] = ""
+    serie_mov: Optional[str] = ""
+    numero_movil: Optional[str] = ""
+
 
 # ---------------------------------------------------------
 # UTILIDADES INTERNAS PDF Y DOOSAN
@@ -268,8 +294,16 @@ def _overlay_rect_with_text(
                 c.drawString(x, y, cur)
                 y -= leading
 
-    overlay_reader = PdfReader(_make_overlay(pw, ph, draw_ops))
+    # --- PREVENCIÓN DE GARBAGE COLLECTION EN BÚFERES TEMPORALES ---
+    overlay_buf = _make_overlay(pw, ph, draw_ops)
+    overlay_reader = PdfReader(overlay_buf)
     page.merge_page(overlay_reader.pages[0])
+
+    if not hasattr(writer, "_overlay_buffers"):
+        writer._overlay_buffers = []
+    writer._overlay_buffers.append(overlay_buf)
+    writer._overlay_buffers.append(overlay_reader)
+
     for i, p in enumerate(reader.pages):
         writer.add_page(page if i == page_index else p)
 
@@ -755,32 +789,50 @@ async def find_text_coords(req: CoordinateRequest):
 # --- ENDPOINT 9: EDIT INCOTERM ---
 @app.post("/edit_incoterm", response_class=Response)
 async def edit_incoterm(req: IncotermReq):
-    reader = _load_pdf_from_b64(req.file_b64)
-    writer = PdfWriter()
-    if req.incoterm_change and req.area:
-        _overlay_rect_with_text(reader, writer, req.area, req.incoterm_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
-    else:
-        for p in reader.pages: writer.add_page(p)
-    return Response(content=_export(writer), media_type="application/pdf")
+    try:
+        reader = _load_pdf_from_b64(req.file_b64)
+        writer = PdfWriter()
+        if req.incoterm_change and req.area:
+            _overlay_rect_with_text(
+                reader, 
+                writer, 
+                req.area, 
+                req.incoterm_text, 
+                font_size=req.font_size, 
+                leading=req.leading, 
+                debug_outline=req.debug_outline
+            )
+        else:
+            for p in reader.pages: 
+                writer.add_page(p)
+        return Response(content=_export(writer), media_type="application/pdf")
+    except Exception as e:
+        print(f">>> [ERROR EDIT_INCOTERM]: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en edit_incoterm: {str(e)}")
 
 
 # --- ENDPOINT 10: EDIT BILLSHIP ---
 @app.post("/edit_billship", response_class=Response)
 async def edit_billship(req: BillShipReq):
-    reader = _load_pdf_from_b64(req.file_b64)
-    writer = PdfWriter()
-    bill_area = req.bill_to_area or Rect(page=0, x=72, y=560, w=220, h=80)
-    ship_area = req.ship_to_area or Rect(page=0, x=300, y=560, w=250, h=80)
-    
-    if req.bill_to_text and req.bill_to_area:
-        _overlay_rect_with_text(reader, writer, bill_area, req.bill_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
-    if req.ship_to_text and req.ship_to_area:
-        _overlay_rect_with_text(reader, writer, ship_area, req.ship_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
+    try:
+        reader = _load_pdf_from_b64(req.file_b64)
+        writer = PdfWriter()
+        bill_area = req.bill_to_area or Rect(page=0, x=72, y=560, w=220, h=80)
+        ship_area = req.ship_to_area or Rect(page=0, x=300, y=560, w=250, h=80)
         
-    if not writer.pages:
-        for p in reader.pages: writer.add_page(p)
-        
-    return Response(content=_export(writer), media_type="application/pdf")
+        if req.bill_to_text and req.bill_to_area:
+            _overlay_rect_with_text(reader, writer, bill_area, req.bill_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
+        if req.ship_to_text and req.ship_to_area:
+            _overlay_rect_with_text(reader, writer, ship_area, req.ship_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
+            
+        if not writer.pages:
+            for p in reader.pages: 
+                writer.add_page(p)
+            
+        return Response(content=_export(writer), media_type="application/pdf")
+    except Exception as e:
+        print(f">>> [ERROR EDIT_BILLSHIP]: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en edit_billship: {str(e)}")
 
 
 # --- ENDPOINT 11: OVERLAY TEXT BATCH ---
@@ -966,7 +1018,7 @@ def validate_reference_request(req: ReferenceParseReq):
         "structure_status": structure_status
     }
 
-# --- ENDPOINT 15: DESCARGAR ARCHIVO LOCAL/ALMACENAMIENTO (NUEVO) ---
+# --- ENDPOINT 15: DESCARGAR ARCHIVO LOCAL/ALMACENAMIENTO ---
 @app.get("/descargar_archivo/{filepath:path}")
 async def descargar_archivo(filepath: str):
     """
@@ -999,6 +1051,80 @@ async def descargar_archivo(filepath: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al descargar archivo: {str(e)}")
+
+
+# --- ENDPOINT 16: GENERAR CARTA RESPONSIVA CON PLANTILLA DOCX ---
+@app.post("/generar-responsiva", response_class=Response)
+def generar_responsiva(req: ResponsivaReq):
+    try:
+        tipo = req.tipo_plantilla.lower().strip()
+        filename_template = f"formato_{tipo}.docx" if tipo in ["laptop", "celular"] else f"formato_laptop.docx"
+        template_path = os.path.join(os.path.dirname(__file__), "plantillas", filename_template)
+        
+        if not os.path.exists(template_path):
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No se encontró la plantilla '{filename_template}' en la carpeta 'plantillas/'."
+            )
+            
+        doc = DocxTemplate(template_path)
+        
+        fecha_actual = datetime.now().strftime("%Y-%m-%d")
+        
+        # Diccionario unificado para mapear ambos formatos de Word
+        context = {
+            "unidad": req.unidad_negocio or "",
+            "sucursal": req.sucursal or "",
+            "extension": req.extension or "",
+            "nombre_completo": req.nombre_completo or "",
+            "correo": req.correo or "",
+            "puesto": req.puesto or "",
+            "departamento": req.departamento or "",
+            "fecha_documento": fecha_actual,
+            "fecha_ingreso": req.fecha_ingreso or "",
+            "fecha ingreso": req.fecha_ingreso or "",  # Soporte por si la plantilla tiene espacio
+            
+            # Campos específicos Laptop
+            "marca": req.marca or "",
+            "modelo": req.modelo or "",
+            "procesador": req.procesador or "",
+            "serie": req.serie or "",
+            
+            # Campos específicos Celular
+            "marca_mov": req.marca_mov or "",
+            "modelo_mov": req.modelo_mov or "",
+            "IMEI": req.IMEI or "",
+            "serie_mov": req.serie_mov or "",
+            "numero_movil": req.numero_movil or ""
+        }
+        
+        doc.render(context)
+        
+        out_buf = BytesIO()
+        doc.save(out_buf)
+        docx_bytes = out_buf.getvalue()
+        
+        nombre_persona_limpio = normalizar_nombre(req.nombre_completo or "Empleado")
+        nombre_archivo = f"Responsiva_{tipo.capitalize()}_{nombre_persona_limpio}.docx"
+        
+        print(f">>> [GENERAR RESPONSIVA] Generada responsiva de {tipo} para {req.nombre_completo} (Ticket #{req.numero_ticket})")
+
+        return Response(
+            content=docx_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": f"attachment; filename={nombre_archivo}",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f">>> [ERROR GENERAR-RESPONSIVA]: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error al procesar la plantilla Word de la carta responsiva: {str(e)}"
+        )
 
 
 if __name__ == "__main__":
