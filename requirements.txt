@@ -12,3 +12,4 @@ mediapipe
 PyMuPDF
 python-docx
 docxtpl
+psutil

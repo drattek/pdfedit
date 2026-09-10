@@ -36,6 +36,9 @@ from reportlab.lib.colors import white, black
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from PyPDF2 import PdfReader, PdfWriter
 
+# --- DIAGNÓSTICO Y MONITOREO DE SISTEMA ---
+import psutil
+
 # --- COMPRESORES GRÁFICOS DE ALTA DENSIDAD ---
 from PIL import Image
 from reportlab.lib.utils import ImageReader
@@ -52,10 +55,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.89 - Fix Renderizado Textbox a Insert Text en Overlays"
+VERSION = "1.90 - Integracion de Telemetria y Diagnostico RAM con psutil"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + PyMuPDF Text Fix)")
+print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + PyMuPDF + Diagnostics)")
 print(f"{'='*40}\n")
 
 # =========================================================
@@ -252,7 +255,7 @@ def _overlay_rect_with_text_fitz(
 ) -> bytes:
     """
     Renderiza texto superpuesto usando PyMuPDF (fitz) mediante insert_text 
-    linea por linea para evitar descartes cuando la altura 'h' es reducida.
+    línea por línea para evitar descartes cuando la altura 'h' es reducida.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page_index = max(0, min(rect.page, len(doc) - 1))
@@ -1155,6 +1158,25 @@ def generar_responsiva(req: ResponsivaReq):
             status_code=500, 
             detail=f"Error al procesar la plantilla Word de la carta responsiva: {str(e)}"
         )
+
+
+# --- ENDPOINT 17: DIAGNÓSTICO DE MEMORIA Y RECURSOS ---
+@app.get("/diagnostics")
+def get_diagnostics():
+    try:
+        mem = psutil.virtual_memory()
+        proc = psutil.Process(os.getpid())
+        return {
+            "status": "success",
+            "version": VERSION,
+            "container_total_ram_mb": round(mem.total / (1024 * 1024), 2),
+            "container_available_ram_mb": round(mem.available / (1024 * 1024), 2),
+            "container_ram_used_pct": mem.percent,
+            "python_process_ram_mb": round(proc.memory_info().rss / (1024 * 1024), 2),
+            "cpu_percent": psutil.cpu_percent(interval=0.2)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al obtener diagnósticos: {str(e)}")
 
 
 if __name__ == "__main__":
