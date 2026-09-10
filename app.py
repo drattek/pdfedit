@@ -52,10 +52,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.86 - Migracion de Overlays y Edicion PDF a PyMuPDF (fitz)"
+VERSION = "1.89 - Fix Renderizado Textbox a Insert Text en Overlays"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + PyMuPDF Engine)")
+print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + PyMuPDF Text Fix)")
 print(f"{'='*40}\n")
 
 # =========================================================
@@ -247,18 +247,19 @@ def _overlay_rect_with_text_fitz(
     text: str,
     font_size: float = 9.0,
     leading: float = 11.0,
-    debug_outline: bool = False
+    debug_outline: bool = False,
+    font_name: str = "Helvetica"
 ) -> bytes:
     """
-    Renderiza texto superpuesto directamente usando PyMuPDF (fitz) para garantizar 
-    compatibilidad del 100% con Aspose.Words, grupos de transparencia y fuentes embebidas.
+    Renderiza texto superpuesto usando PyMuPDF (fitz) mediante insert_text 
+    linea por linea para evitar descartes cuando la altura 'h' es reducida.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page_index = max(0, min(rect.page, len(doc) - 1))
     page = doc.load_page(page_index)
-
-    # Conversión de coordenadas (PyMuPDF usa origen superior-izquierdo, ReportLab inferior-izquierdo)
     page_height = page.rect.height
+
+    # Conversión de coordenadas (PyMuPDF usa origen superior-izquierdo)
     fitz_rect = fitz.Rect(
         rect.x, 
         page_height - rect.y - rect.h, 
@@ -269,24 +270,33 @@ def _overlay_rect_with_text_fitz(
     if debug_outline:
         page.draw_rect(fitz_rect, color=(1, 0, 0), width=1)
     else:
-        # Dibujar rectángulo blanco para cubrir el texto original
+        # 1. Dibujar rectángulo blanco para cubrir el texto original
         page.draw_rect(fitz_rect, color=(1, 1, 1), fill=(1, 1, 1))
 
-        # Insertar texto dentro de la caja delimitadora
+        # 2. Selección de fuente
         fname = "helv"
-        page.insert_textbox(
-            fitz_rect,
-            text or "",
-            fontsize=font_size,
-            fontname=fname,
-            color=(0, 0, 0),
-            align=0  # Alineación izquierda
-        )
+        if "bold" in (font_name or "").lower():
+            fname = "hebo"
 
-    out_buf = BytesIO()
-    doc.save(out_buf)
+        # 3. Insertar texto línea por línea (garantiza renderizado constante)
+        lines = (text or "").split("\n")
+        x0 = rect.x + 1
+        y_baseline = (page_height - rect.y - rect.h) + (font_size * 0.85)
+
+        for line in lines:
+            if line.strip():
+                page.insert_text(
+                    fitz.Point(x0, y_baseline),
+                    line,
+                    fontsize=font_size,
+                    fontname=fname,
+                    color=(0, 0, 0)
+                )
+            y_baseline += leading if leading > 0 else (font_size + 2)
+
+    out_bytes = doc.tobytes()
     doc.close()
-    return out_buf.getvalue()
+    return out_bytes
 
 
 class AuthException(Exception):
@@ -447,7 +457,7 @@ async def extraer_rostro(req: ExtractFaceReq):
         return {"status": "error", "message": str(e), "rostro_b64": None}
 
 
-# --- ENDPOINT 2: GENERAR PDF ---
+# --- ENDPOINT 2: GENERAR PDF (OPTIMIZADO Y PROTEGIDO CON PLAYWRIGHT) ---
 @app.post("/generate-pdf", response_class=Response)
 def generate_pdf(req: PDFRequest):
     try:
@@ -458,12 +468,19 @@ def generate_pdf(req: PDFRequest):
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--single-process"
+                ]
             )
             context = browser.new_context()
             page = context.new_page()
-            page.set_content(html_final)
-            page.wait_for_load_state("networkidle")
+            page.set_default_timeout(15000)  # 15 segundos máximo por renderizado
+            
+            # Carga inmediata sin esperar inactividad de red
+            page.set_content(html_final, wait_until="domcontentloaded", timeout=15000)
             
             pdf_bytes = page.pdf(
                 format="Letter",
@@ -829,41 +846,18 @@ async def overlay_text_batch(req: CustomBatchReq):
         if not req.ops:
             return Response(content=pdf_bytes, media_type="application/pdf")
         
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for op in req.ops:
-            page_index = max(0, min(op.area.page, len(doc) - 1))
-            page = doc.load_page(page_index)
-            page_height = page.rect.height
-            
-            fitz_rect = fitz.Rect(
-                op.area.x,
-                page_height - op.area.y - op.area.h,
-                op.area.x + op.area.w,
-                page_height - op.area.y
+            pdf_bytes = _overlay_rect_with_text_fitz(
+                pdf_bytes,
+                op.area,
+                op.text,
+                font_size=op.font_size or 9.0,
+                leading=op.leading or 11.0,
+                debug_outline=op.debug_outline or False,
+                font_name=op.font_name or "Helvetica"
             )
             
-            if op.debug_outline:
-                page.draw_rect(fitz_rect, color=(1, 0, 0), width=1)
-            else:
-                page.draw_rect(fitz_rect, color=(1, 1, 1), fill=(1, 1, 1))
-                
-                fname = "helv"
-                if "bold" in (op.font_name or "").lower():
-                    fname = "hebo"
-                    
-                page.insert_textbox(
-                    fitz_rect,
-                    op.text or "",
-                    fontsize=op.font_size or 9.0,
-                    fontname=fname,
-                    color=(0, 0, 0),
-                    align=0
-                )
-                
-        out_buf = BytesIO()
-        doc.save(out_buf)
-        doc.close()
-        return Response(content=out_buf.getvalue(), media_type="application/pdf")
+        return Response(content=pdf_bytes, media_type="application/pdf")
     except Exception as e:
         print(f">>> [ERROR OVERLAY_TEXT_BATCH FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
@@ -882,11 +876,10 @@ async def cut_range(req: CutRangeReq):
         doc_out = fitz.open()
         doc_out.insert_pdf(doc, from_page=start, to_page=end)
         
-        out_buf = BytesIO()
-        doc_out.save(out_buf)
+        out_bytes = doc_out.tobytes()
         doc.close()
         doc_out.close()
-        return Response(content=out_buf.getvalue(), media_type="application/pdf")
+        return Response(content=out_bytes, media_type="application/pdf")
     except Exception as e:
         print(f">>> [ERROR CUT_RANGE FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en cut_range: {str(e)}")
@@ -905,11 +898,10 @@ async def extract_custom_pages(req: CustomPagesReq):
             if 0 <= p_num < total:
                 doc_out.insert_pdf(doc, from_page=p_num, to_page=p_num)
                 
-        out_buf = BytesIO()
-        doc_out.save(out_buf)
+        out_bytes = doc_out.tobytes()
         doc.close()
         doc_out.close()
-        return Response(content=out_buf.getvalue(), media_type="application/pdf")
+        return Response(content=out_bytes, media_type="application/pdf")
     except Exception as e:
         print(f">>> [ERROR EXTRACT_CUSTOM_PAGES FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en extract_custom_pages: {str(e)}")
