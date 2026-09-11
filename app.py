@@ -55,10 +55,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.90 - Integracion de Telemetria y Diagnostico RAM con psutil"
+VERSION = "1.91.1 - Fix ThreadPool + doc.select in-place para cut_range"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + PyMuPDF + Diagnostics)")
+print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + PyMuPDF Non-Blocking)")
 print(f"{'='*40}\n")
 
 # =========================================================
@@ -371,7 +371,7 @@ def _doosan_navigate_to_results(context, user, password, f_start, f_end):
 
 # --- ENDPOINT 1: EXTRAER ROSTRO ---
 @app.post("/extraer_rostro")
-async def extraer_rostro(req: ExtractFaceReq):
+def extraer_rostro(req: ExtractFaceReq):
     try:
         file_bytes = base64.b64decode(req.file_b64)
         file_name = (req.file_name or "documento.pdf").lower()
@@ -460,7 +460,7 @@ async def extraer_rostro(req: ExtractFaceReq):
         return {"status": "error", "message": str(e), "rostro_b64": None}
 
 
-# --- ENDPOINT 2: GENERAR PDF (OPTIMIZADO Y PROTEGIDO CON PLAYWRIGHT) ---
+# --- ENDPOINT 2: GENERAR PDF (SISTEMA DE RENDERIZADO ESTABLE) ---
 @app.post("/generate-pdf", response_class=Response)
 def generate_pdf(req: PDFRequest):
     try:
@@ -474,16 +474,13 @@ def generate_pdf(req: PDFRequest):
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--single-process"
+                    "--disable-dev-shm-usage"
                 ]
             )
             context = browser.new_context()
             page = context.new_page()
-            page.set_default_timeout(15000)  # 15 segundos máximo por renderizado
-            
-            # Carga inmediata sin esperar inactividad de red
-            page.set_content(html_final, wait_until="domcontentloaded", timeout=15000)
+            page.set_default_timeout(30000)
+            page.set_content(html_final, wait_until="domcontentloaded", timeout=30000)
             
             pdf_bytes = page.pdf(
                 format="Letter",
@@ -627,7 +624,7 @@ def generate_word(req: WordRequest):
 
 # --- ENDPOINT 4: OPTIMIZAR PDF ---
 @app.post("/optimizar_pdf", response_class=Response)
-async def optimizar_pdf(req: OptimizePDFReq):
+def optimizar_pdf(req: OptimizePDFReq):
     try:
         raw_bytes = base64.b64decode(req.file_b64)
         reader = PdfReader(BytesIO(raw_bytes))
@@ -755,7 +752,7 @@ def descarga_invoice(req: DownloadRequest):
 
 # --- ENDPOINT 7: EXTRACT COORDINATES ---
 @app.post("/extract_coordinates")
-async def get_coordinates(req: CoordinateRequest):
+def get_coordinates(req: CoordinateRequest):
     try:
         raw = base64.b64decode(req.file_b64)
         with pdfplumber.open(BytesIO(raw)) as pdf:
@@ -771,7 +768,7 @@ async def get_coordinates(req: CoordinateRequest):
 
 # --- ENDPOINT 8: FIND TEXT COORDS ---
 @app.post("/find_text_coords")
-async def find_text_coords(req: CoordinateRequest):
+def find_text_coords(req: CoordinateRequest):
     try:
         pdf_bytes = base64.b64decode(req.file_b64)
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
@@ -789,7 +786,7 @@ async def find_text_coords(req: CoordinateRequest):
 
 # --- ENDPOINT 9: EDIT INCOTERM (MOTOR FITZ / PYMUPDF) ---
 @app.post("/edit_incoterm", response_class=Response)
-async def edit_incoterm(req: IncotermReq):
+def edit_incoterm(req: IncotermReq):
     try:
         raw_bytes = base64.b64decode(req.file_b64)
         if req.incoterm_change and req.area:
@@ -812,7 +809,7 @@ async def edit_incoterm(req: IncotermReq):
 
 # --- ENDPOINT 10: EDIT BILLSHIP (MOTOR FITZ / PYMUPDF) ---
 @app.post("/edit_billship", response_class=Response)
-async def edit_billship(req: BillShipReq):
+def edit_billship(req: BillShipReq):
     try:
         pdf_bytes = base64.b64decode(req.file_b64)
         bill_area = req.bill_to_area or Rect(page=0, x=72, y=560, w=220, h=80)
@@ -843,7 +840,7 @@ async def edit_billship(req: BillShipReq):
 
 # --- ENDPOINT 11: OVERLAY TEXT BATCH (MOTOR FITZ / PYMUPDF) ---
 @app.post("/overlay_text_batch", response_class=Response)
-async def overlay_text_batch(req: CustomBatchReq):
+def overlay_text_batch(req: CustomBatchReq):
     try:
         pdf_bytes = base64.b64decode(req.file_b64)
         if not req.ops:
@@ -866,9 +863,9 @@ async def overlay_text_batch(req: CustomBatchReq):
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
-# --- ENDPOINT 12: CUT RANGE (MOTOR FITZ / PYMUPDF) ---
+# --- ENDPOINT 12: CUT RANGE (MOTOR FITZ CON RECORTE IN-PLACE NON-BLOCKING) ---
 @app.post("/cut_range", response_class=Response)
-async def cut_range(req: CutRangeReq):
+def cut_range(req: CutRangeReq):
     try:
         raw_bytes = base64.b64decode(req.file_b64)
         doc = fitz.open(stream=raw_bytes, filetype="pdf")
@@ -876,12 +873,12 @@ async def cut_range(req: CutRangeReq):
         start = max(0, min(req.start_page, total - 1))
         end = max(start, min(req.final_page, total - 1))
         
-        doc_out = fitz.open()
-        doc_out.insert_pdf(doc, from_page=start, to_page=end)
+        # Selección in-place sin reconstruir objetos vectoriales de Aspose
+        pages_to_keep = list(range(start, end + 1))
+        doc.select(pages_to_keep)
         
-        out_bytes = doc_out.tobytes()
+        out_bytes = doc.tobytes()
         doc.close()
-        doc_out.close()
         return Response(content=out_bytes, media_type="application/pdf")
     except Exception as e:
         print(f">>> [ERROR CUT_RANGE FITZ]: {str(e)}")
@@ -890,20 +887,18 @@ async def cut_range(req: CutRangeReq):
 
 # --- ENDPOINT 13: EXTRACT CUSTOM PAGES ---
 @app.post("/extract_custom_pages", response_class=Response)
-async def extract_custom_pages(req: CustomPagesReq):
+def extract_custom_pages(req: CustomPagesReq):
     try:
         raw_bytes = base64.b64decode(req.file_b64)
         doc = fitz.open(stream=raw_bytes, filetype="pdf")
         total = len(doc)
         
-        doc_out = fitz.open()
-        for p_num in req.pages:
-            if 0 <= p_num < total:
-                doc_out.insert_pdf(doc, from_page=p_num, to_page=p_num)
+        valid_pages = [p for p in req.pages if 0 <= p < total]
+        if valid_pages:
+            doc.select(valid_pages)
                 
-        out_bytes = doc_out.tobytes()
+        out_bytes = doc.tobytes()
         doc.close()
-        doc_out.close()
         return Response(content=out_bytes, media_type="application/pdf")
     except Exception as e:
         print(f">>> [ERROR EXTRACT_CUSTOM_PAGES FITZ]: {str(e)}")
@@ -1053,7 +1048,7 @@ def validate_reference_request(req: ReferenceParseReq):
 
 # --- ENDPOINT 15: DESCARGAR ARCHIVO LOCAL/ALMACENAMIENTO ---
 @app.get("/descargar_archivo/{filepath:path}")
-async def descargar_archivo(filepath: str):
+def descargar_archivo(filepath: str):
     """
     Descarga cualquier archivo almacenado en el microservicio o sus volúmenes.
     Ejemplo de llamada: GET /descargar_archivo/archivos/mi_documento.pdf
