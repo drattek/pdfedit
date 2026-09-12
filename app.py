@@ -16,6 +16,46 @@ INSTRUCCIONES PERMANENTES PARA IA / GEMINI (DIRECTIVAS DE EDICIÓN QUIRÚRGICA)
 ===============================================================================
 """
 
+import os
+import sys
+from collections import deque
+from datetime import datetime, timedelta
+
+# --- BLOQUEO DE COMPETENCIA DE HILOS EN C (PREVENCIÓN SIGSEGV EN LINUX) ---
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+# =========================================================
+# RECOLECTOR DE LOGS EN MEMORIA PARA N8N
+# =========================================================
+LOG_BUFFER = deque(maxlen=200)
+
+class LogCollector:
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, message):
+        self.stream.write(message)
+        if message.strip():
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            LOG_BUFFER.append(f"[{timestamp}] {message.strip()}")
+
+    def flush(self):
+        self.stream.flush()
+
+sys.stdout = LogCollector(sys.stdout)
+sys.stderr = LogCollector(sys.stderr)
+
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+try:
+    from concurrent.futures.process import BrokenProcessPool
+except ImportError:
+    from concurrent.futures import BrokenExecutor as BrokenProcessPool
+
 from fastapi import FastAPI, Response, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,12 +63,10 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from io import BytesIO
 import base64
-import os
 import time
 import re
 import unicodedata
 import urllib.request
-from datetime import datetime, timedelta
 import pdfplumber
 from playwright.sync_api import sync_playwright
 from reportlab.pdfgen import canvas
@@ -45,6 +83,8 @@ from reportlab.lib.utils import ImageReader
 
 # --- LIBRERÍAS DE DETECCIÓN Y EXTRACCIÓN FACIAL ---
 import cv2
+cv2.setNumThreads(0)  # Desactiva multithreading interno de OpenCV
+
 import fitz  # PyMuPDF
 import numpy as np
 
@@ -55,11 +95,14 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.91.1 - Fix ThreadPool + doc.select in-place para cut_range"
+VERSION = "1.94 - Integracion de Collector de Logs en Memoria (GET /logs)"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + PyMuPDF Non-Blocking)")
+print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + Log Telemetry)")
 print(f"{'='*40}\n")
+
+# Pool de procesos aislados para evitar que fallos de C derriben el servidor principal
+process_executor = ProcessPoolExecutor(max_workers=2)
 
 # =========================================================
 # CARGA AUTÓNOMA DE MODELOS FACIALES
@@ -232,17 +275,35 @@ class ResponsivaReq(BaseModel):
 
 
 # ---------------------------------------------------------
-# UTILIDADES INTERNAS PDF (PyMuPDF / fitz Engine)
+# WORKERS AISLADOS EN PROCESO INDEPENDIENTE (ANTI-SEGFAULT)
 # ---------------------------------------------------------
-
-def _load_pdf_from_b64(file_b64: str) -> PdfReader:
-    raw = base64.b64decode(file_b64)
-    return PdfReader(BytesIO(raw))
 
 def _export(writer: PdfWriter) -> bytes:
     out = BytesIO()
     writer.write(out)
     return out.getvalue()
+
+def _worker_cut_range(raw_bytes: bytes, start_page: int, final_page: int) -> bytes:
+    """Ejecuta el recorte de páginas en un subproceso aislado con fallback a PyPDF2."""
+    try:
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+        total = len(doc)
+        start = max(0, min(start_page, total - 1))
+        end = max(start, min(final_page, total - 1))
+        
+        doc.select(list(range(start, end + 1)))
+        out_bytes = doc.tobytes()
+        doc.close()
+        return out_bytes
+    except Exception as e_fitz:
+        reader = PdfReader(BytesIO(raw_bytes))
+        writer = PdfWriter()
+        total = len(reader.pages)
+        start = max(0, min(start_page, total - 1))
+        end = max(start, min(final_page, total - 1))
+        for i in range(start, end + 1):
+            writer.add_page(reader.pages[i])
+        return _export(writer)
 
 def _overlay_rect_with_text_fitz(
     pdf_bytes: bytes,
@@ -253,16 +314,12 @@ def _overlay_rect_with_text_fitz(
     debug_outline: bool = False,
     font_name: str = "Helvetica"
 ) -> bytes:
-    """
-    Renderiza texto superpuesto usando PyMuPDF (fitz) mediante insert_text 
-    línea por línea para evitar descartes cuando la altura 'h' es reducida.
-    """
+    """Renderiza texto superpuesto con PyMuPDF (fitz) usando insert_text línea por línea."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page_index = max(0, min(rect.page, len(doc) - 1))
     page = doc.load_page(page_index)
     page_height = page.rect.height
 
-    # Conversión de coordenadas (PyMuPDF usa origen superior-izquierdo)
     fitz_rect = fitz.Rect(
         rect.x, 
         page_height - rect.y - rect.h, 
@@ -273,15 +330,12 @@ def _overlay_rect_with_text_fitz(
     if debug_outline:
         page.draw_rect(fitz_rect, color=(1, 0, 0), width=1)
     else:
-        # 1. Dibujar rectángulo blanco para cubrir el texto original
         page.draw_rect(fitz_rect, color=(1, 1, 1), fill=(1, 1, 1))
 
-        # 2. Selección de fuente
         fname = "helv"
         if "bold" in (font_name or "").lower():
             fname = "hebo"
 
-        # 3. Insertar texto línea por línea (garantiza renderizado constante)
         lines = (text or "").split("\n")
         x0 = rect.x + 1
         y_baseline = (page_height - rect.y - rect.h) + (font_size * 0.85)
@@ -399,7 +453,6 @@ def extraer_rostro(req: ExtractFaceReq):
         if img_cv2 is None:
             return {"status": "error", "message": "No se pudo decodificar la imagen del archivo.", "rostro_b64": None}
 
-        # --- 1. ENDEREZADO MATEMÁTICO DIRECTO ---
         if req.angle != 0:
             (h, w) = img_cv2.shape[:2]
             center = (w // 2, h // 2)
@@ -416,9 +469,7 @@ def extraer_rostro(req: ExtractFaceReq):
             M[1, 2] += bound_h / 2 - center[1]
             
             img_cv2 = cv2.warpAffine(img_cv2, M, (bound_w, bound_h), borderValue=(255, 255, 255))
-            print(f">>> [EXTRACTOR ROSTRO] Documento enderezado a {angulo_corregido}° exitosamente.")
 
-        # --- 2. BÚSQUEDA DEL ROSTRO ---
         gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
         gray_eq = cv2.equalizeHist(gray)
 
@@ -428,7 +479,6 @@ def extraer_rostro(req: ExtractFaceReq):
             faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(50, 50))
 
         if len(faces) == 0:
-            print(">>> [EXTRACTOR ROSTRO] Aviso: No se localizó ningún rostro en el documento.")
             return {"status": "error", "message": "No se detectó ningún rostro en el documento.", "rostro_b64": None}
 
         faces = sorted(faces, key=lambda b: b[2] * b[3], reverse=True)
@@ -447,8 +497,6 @@ def extraer_rostro(req: ExtractFaceReq):
         _, buffer = cv2.imencode('.jpg', rostro_recortado, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
         rostro_b64 = base64.b64encode(buffer).decode('utf-8')
 
-        print(">>> [EXTRACTOR ROSTRO] ¡Éxito! Rostro extraído correctamente mediante OpenCV.")
-
         return {
             "status": "success",
             "message": "Rostro extraído correctamente.",
@@ -460,7 +508,7 @@ def extraer_rostro(req: ExtractFaceReq):
         return {"status": "error", "message": str(e), "rostro_b64": None}
 
 
-# --- ENDPOINT 2: GENERAR PDF (SISTEMA DE RENDERIZADO ESTABLE) ---
+# --- ENDPOINT 2: GENERAR PDF ---
 @app.post("/generate-pdf", response_class=Response)
 def generate_pdf(req: PDFRequest):
     try:
@@ -519,7 +567,6 @@ def generate_pdf(req: PDFRequest):
 @app.post("/generate-word", response_class=Response)
 def generate_word(req: WordRequest):
     try:
-        print("\n>>> [GENERATE WORD] Creando archivo Word (.docx)...")
         doc = Document()
 
         for section in doc.sections:
@@ -607,8 +654,6 @@ def generate_word(req: WordRequest):
         
         filename_final = f"{prefijo_limpio}_{nombre_limpio}.docx"
 
-        print(f">>> [GENERATE WORD] ¡Éxito! Archivo generado: {filename_final}")
-
         return Response(
             content=docx_bytes,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -688,10 +733,6 @@ def optimizar_pdf(req: OptimizePDFReq):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al procesar el PDF: {str(e)}")
 
-
-# =========================================================
-# ENDPOINTS RECUPERADOS DE LA VERSIÓN 1.60
-# =========================================================
 
 # --- ENDPOINT 5: BUSCA INVOICE DOOSAN ---
 @app.post("/buscaInvoice")
@@ -784,7 +825,7 @@ def find_text_coords(req: CoordinateRequest):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ENDPOINT 9: EDIT INCOTERM (MOTOR FITZ / PYMUPDF) ---
+# --- ENDPOINT 9: EDIT INCOTERM ---
 @app.post("/edit_incoterm", response_class=Response)
 def edit_incoterm(req: IncotermReq):
     try:
@@ -807,7 +848,7 @@ def edit_incoterm(req: IncotermReq):
         raise HTTPException(status_code=500, detail=f"Error en edit_incoterm: {str(e)}")
 
 
-# --- ENDPOINT 10: EDIT BILLSHIP (MOTOR FITZ / PYMUPDF) ---
+# --- ENDPOINT 10: EDIT BILLSHIP ---
 @app.post("/edit_billship", response_class=Response)
 def edit_billship(req: BillShipReq):
     try:
@@ -838,7 +879,7 @@ def edit_billship(req: BillShipReq):
         raise HTTPException(status_code=500, detail=f"Error en edit_billship: {str(e)}")
 
 
-# --- ENDPOINT 11: OVERLAY TEXT BATCH (MOTOR FITZ / PYMUPDF) ---
+# --- ENDPOINT 11: OVERLAY TEXT BATCH ---
 @app.post("/overlay_text_batch", response_class=Response)
 def overlay_text_batch(req: CustomBatchReq):
     try:
@@ -863,25 +904,29 @@ def overlay_text_batch(req: CustomBatchReq):
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
-# --- ENDPOINT 12: CUT RANGE (MOTOR FITZ CON RECORTE IN-PLACE NON-BLOCKING) ---
+# --- ENDPOINT 12: CUT RANGE (PROTEGIDO EN PROCESO AISLADO CON PROCESSPOOL) ---
 @app.post("/cut_range", response_class=Response)
 def cut_range(req: CutRangeReq):
     try:
         raw_bytes = base64.b64decode(req.file_b64)
-        doc = fitz.open(stream=raw_bytes, filetype="pdf")
-        total = len(doc)
-        start = max(0, min(req.start_page, total - 1))
-        end = max(start, min(req.final_page, total - 1))
+        loop = asyncio.get_event_loop()
         
-        # Selección in-place sin reconstruir objetos vectoriales de Aspose
-        pages_to_keep = list(range(start, end + 1))
-        doc.select(pages_to_keep)
-        
-        out_bytes = doc.tobytes()
-        doc.close()
+        out_bytes = await loop.run_in_executor(
+            process_executor,
+            _worker_cut_range,
+            raw_bytes,
+            req.start_page,
+            req.final_page
+        )
         return Response(content=out_bytes, media_type="application/pdf")
+    except BrokenProcessPool:
+        print(">>> [CRITICAL CUT_RANGE]: Se detectó SegFault de C en subproceso. Reiniciando pool...")
+        raise HTTPException(
+            status_code=500, 
+            detail="Error crítico de C en el procesador PDF. La estructura del PDF colapsó el motor."
+        )
     except Exception as e:
-        print(f">>> [ERROR CUT_RANGE FITZ]: {str(e)}")
+        print(f">>> [ERROR CUT_RANGE]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en cut_range: {str(e)}")
 
 
@@ -1058,7 +1103,6 @@ def descargar_archivo(filepath: str):
         base_dir = os.path.abspath(os.path.dirname(__file__))
         target_path = os.path.abspath(os.path.join(base_dir, filepath))
 
-        # Validación anti-Directory Traversal (Evita acceder fuera del contenedor/app)
         if not target_path.startswith(base_dir):
             raise HTTPException(
                 status_code=400, 
@@ -1099,7 +1143,6 @@ def generar_responsiva(req: ResponsivaReq):
         
         fecha_actual = datetime.now().strftime("%Y-%m-%d")
         
-        # Diccionario unificado para mapear ambos formatos de Word
         context = {
             "unidad": req.unidad_negocio or "",
             "sucursal": req.sucursal or "",
@@ -1110,15 +1153,13 @@ def generar_responsiva(req: ResponsivaReq):
             "departamento": req.departamento or "",
             "fecha_documento": fecha_actual,
             "fecha_ingreso": req.fecha_ingreso or "",
-            "fecha ingreso": req.fecha_ingreso or "",  # Soporte por si la plantilla tiene espacio
+            "fecha ingreso": req.fecha_ingreso or "",
             
-            # Campos específicos Laptop
             "marca": req.marca or "",
             "modelo": req.modelo or "",
             "procesador": req.procesador or "",
             "serie": req.serie or "",
             
-            # Campos específicos Celular
             "marca_mov": req.marca_mov or "",
             "modelo_mov": req.modelo_mov or "",
             "IMEI": req.IMEI or "",
@@ -1172,6 +1213,22 @@ def get_diagnostics():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al obtener diagnósticos: {str(e)}")
+
+
+# --- ENDPOINT 18: CONSULTA DE LOGS EN TIEMPO REAL ---
+@app.get("/logs")
+def get_logs(limit: int = 50):
+    """Retorna las últimas líneas del registro de la consola del contenedor."""
+    try:
+        logs_list = list(LOG_BUFFER)
+        return {
+            "status": "success",
+            "version": VERSION,
+            "total_lines": len(logs_list),
+            "logs": logs_list[-limit:]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al consultar logs: {str(e)}")
 
 
 if __name__ == "__main__":
