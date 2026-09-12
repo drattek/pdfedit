@@ -906,7 +906,7 @@ def overlay_text_batch(req: CustomBatchReq):
 
 # --- ENDPOINT 12: CUT RANGE (PROTEGIDO EN PROCESO AISLADO CON PROCESSPOOL) ---
 @app.post("/cut_range", response_class=Response)
-async def cut_range(req: CutRangeReq):
+def cut_range(req: CutRangeReq):
     try:
         raw_bytes = base64.b64decode(req.file_b64)
         loop = asyncio.get_event_loop()
