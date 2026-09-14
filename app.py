@@ -81,10 +81,6 @@ import psutil
 from PIL import Image
 from reportlab.lib.utils import ImageReader
 
-# --- LIBRERÍAS DE DETECCIÓN Y EXTRACCIÓN FACIAL ---
-import cv2
-cv2.setNumThreads(0)  # Desactiva multithreading interno de OpenCV
-
 import fitz  # PyMuPDF
 import numpy as np
 
@@ -95,30 +91,14 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "1.94 - Integracion de Collector de Logs en Memoria (GET /logs)"
+VERSION = "2.00 - Depuración Completa Extracción Facial y Optimización de Memoria"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Integración Completa v1.70 + v1.80 + Log Telemetry)")
+print(f" MODO: Producción n8n (Sin módulo facial / Máximo rendimiento)")
 print(f"{'='*40}\n")
 
 # Pool de procesos aislados para evitar que fallos de C derriben el servidor principal
 process_executor = ProcessPoolExecutor(max_workers=2)
-
-# =========================================================
-# CARGA AUTÓNOMA DE MODELOS FACIALES
-# =========================================================
-CASCADE_PATH = os.path.join(os.path.dirname(__file__), "haarcascade_frontalface_default.xml")
-CASCADE_URL = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
-
-if not os.path.exists(CASCADE_PATH):
-    try:
-        print(">>> [FACE DETECTOR] Descargando modelo de rostro OpenCV por primera vez...")
-        urllib.request.urlretrieve(CASCADE_URL, CASCADE_PATH)
-        print(">>> [FACE DETECTOR] ¡Modelo descargado con éxito!")
-    except Exception as e:
-        print(f">>> [FACE DETECTOR] Error descargando modelo: {e}")
-
-face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
 app = FastAPI(title=f"PDF Edit & Doosan Service v{VERSION} — Vegusa Enterprise")
 
@@ -175,11 +155,6 @@ class DownloadRequest(BaseModel):
 class OptimizePDFReq(BaseModel):
     file_b64: str
     file_name: Optional[str] = "ine_optimizada.pdf"
-
-class ExtractFaceReq(BaseModel):
-    file_b64: str
-    file_name: Optional[str] = "documento.pdf"
-    angle: float = 0.0
 
 class Rect(BaseModel):
     page: int = Field(0, description="0-based page index")
@@ -244,12 +219,11 @@ class PDFRequest(BaseModel):
 
 class WordRequest(BaseModel):
     datosExtraidos: dict
-    rostro_b64: Optional[str] = None
     remitente_name: Optional[str] = "Cliente"
     prefijo: Optional[str] = "Identificacion"
 
 class ResponsivaReq(BaseModel):
-    tipo_plantilla: str  # "laptop" o "celular"
+    tipo_plantilla: str
     numero_ticket: Optional[str] = ""
     nombre_completo: Optional[str] = ""
     puesto: Optional[str] = ""
@@ -259,14 +233,10 @@ class ResponsivaReq(BaseModel):
     correo: Optional[str] = ""
     fecha_ingreso: Optional[str] = ""
     extension: Optional[str] = ""
-    
-    # Variables de Laptop
     marca: Optional[str] = ""
     modelo: Optional[str] = ""
     procesador: Optional[str] = ""
     serie: Optional[str] = ""
-    
-    # Variables de Celular
     marca_mov: Optional[str] = ""
     modelo_mov: Optional[str] = ""
     IMEI: Optional[str] = ""
@@ -275,7 +245,7 @@ class ResponsivaReq(BaseModel):
 
 
 # ---------------------------------------------------------
-# WORKERS AISLADOS EN PROCESO INDEPENDIENTE (ANTI-SEGFAULT)
+# WORKERS AISLADOS EN PROCESO INDEPENDIENTE
 # ---------------------------------------------------------
 
 def _export(writer: PdfWriter) -> bytes:
@@ -284,7 +254,6 @@ def _export(writer: PdfWriter) -> bytes:
     return out.getvalue()
 
 def _worker_cut_range(raw_bytes: bytes, start_page: int, final_page: int) -> bytes:
-    """Ejecuta el recorte de páginas en un subproceso aislado con fallback a PyPDF2."""
     try:
         doc = fitz.open(stream=raw_bytes, filetype="pdf")
         total = len(doc)
@@ -295,7 +264,7 @@ def _worker_cut_range(raw_bytes: bytes, start_page: int, final_page: int) -> byt
         out_bytes = doc.tobytes()
         doc.close()
         return out_bytes
-    except Exception as e_fitz:
+    except Exception:
         reader = PdfReader(BytesIO(raw_bytes))
         writer = PdfWriter()
         total = len(reader.pages)
@@ -314,7 +283,6 @@ def _overlay_rect_with_text_fitz(
     debug_outline: bool = False,
     font_name: str = "Helvetica"
 ) -> bytes:
-    """Renderiza texto superpuesto con PyMuPDF (fitz) usando insert_text línea por línea."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page_index = max(0, min(rect.page, len(doc) - 1))
     page = doc.load_page(page_index)
@@ -423,92 +391,7 @@ def _doosan_navigate_to_results(context, user, password, f_start, f_end):
 # ENDPOINTS DE LA API
 # ---------------------------------------------------------
 
-# --- ENDPOINT 1: EXTRAER ROSTRO ---
-@app.post("/extraer_rostro")
-def extraer_rostro(req: ExtractFaceReq):
-    try:
-        file_bytes = base64.b64decode(req.file_b64)
-        file_name = (req.file_name or "documento.pdf").lower()
-        img_cv2 = None
-
-        print(f"\n>>> [EXTRACTOR ROSTRO NATIVO] Procesando archivo: {file_name} (Ángulo recibido: {req.angle}°)")
-
-        if file_name.endswith('.pdf'):
-            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
-            if len(pdf_doc) == 0:
-                return {"status": "error", "message": "El archivo PDF está vacío.", "rostro_b64": None}
-            
-            page = pdf_doc.load_page(0)
-            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-            img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            
-            if pix.n == 4:
-                img_cv2 = cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGR)
-            else:
-                img_cv2 = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        else:
-            nparr = np.frombuffer(file_bytes, np.uint8)
-            img_cv2 = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if img_cv2 is None:
-            return {"status": "error", "message": "No se pudo decodificar la imagen del archivo.", "rostro_b64": None}
-
-        if req.angle != 0:
-            (h, w) = img_cv2.shape[:2]
-            center = (w // 2, h // 2)
-            
-            angulo_corregido = float(req.angle)
-            M = cv2.getRotationMatrix2D(center, angulo_corregido, 1.0)
-            
-            abs_cos = abs(M[0, 0])
-            abs_sin = abs(M[0, 1])
-            bound_w = int(h * abs_sin + w * abs_cos)
-            bound_h = int(h * abs_cos + w * abs_sin)
-            
-            M[0, 2] += bound_w / 2 - center[0]
-            M[1, 2] += bound_h / 2 - center[1]
-            
-            img_cv2 = cv2.warpAffine(img_cv2, M, (bound_w, bound_h), borderValue=(255, 255, 255))
-
-        gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-        gray_eq = cv2.equalizeHist(gray)
-
-        faces = face_cascade.detectMultiScale(gray_eq, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-            
-        if len(faces) == 0:
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(50, 50))
-
-        if len(faces) == 0:
-            return {"status": "error", "message": "No se detectó ningún rostro en el documento.", "rostro_b64": None}
-
-        faces = sorted(faces, key=lambda b: b[2] * b[3], reverse=True)
-        (x, y, w, h) = faces[0]
-
-        h_img, w_img, _ = img_cv2.shape
-        margen_y = int(h * 0.25)
-        margen_x = int(w * 0.20)
-        
-        y1 = max(0, y - margen_y)
-        y2 = min(h_img, y + h + margen_y)
-        x1 = max(0, x - margen_x)
-        x2 = min(w_img, x + w + margen_x)
-
-        rostro_recortado = img_cv2[y1:y2, x1:x2]
-        _, buffer = cv2.imencode('.jpg', rostro_recortado, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-        rostro_b64 = base64.b64encode(buffer).decode('utf-8')
-
-        return {
-            "status": "success",
-            "message": "Rostro extraído correctamente.",
-            "rostro_b64": rostro_b64
-        }
-
-    except Exception as e:
-        print(f">>> [ERROR EXTRACTOR ROSTRO]: {str(e)}")
-        return {"status": "error", "message": str(e), "rostro_b64": None}
-
-
-# --- ENDPOINT 2: GENERAR PDF ---
+# --- ENDPOINT 1: GENERAR PDF ---
 @app.post("/generate-pdf", response_class=Response)
 def generate_pdf(req: PDFRequest):
     try:
@@ -563,7 +446,7 @@ def generate_pdf(req: PDFRequest):
         )
 
 
-# --- ENDPOINT 3: GENERAR WORD ---
+# --- ENDPOINT 2: GENERAR WORD ---
 @app.post("/generate-word", response_class=Response)
 def generate_word(req: WordRequest):
     try:
@@ -586,18 +469,6 @@ def generate_word(req: WordRequest):
         run_title.bold = True
         run_title.font.size = Pt(15)
         run_title.font.color.rgb = RGBColor(15, 23, 42)
-
-        if req.rostro_b64:
-            try:
-                img_bytes = base64.b64decode(req.rostro_b64)
-                img_stream = BytesIO(img_bytes)
-                p_face = doc.add_paragraph()
-                p_face.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                p_face.paragraph_format.space_before = Pt(10)
-                p_face.paragraph_format.space_after = Pt(10)
-                p_face.add_run().add_picture(img_stream, width=Inches(1.2))
-            except Exception as e_img:
-                print(f"--> Aviso al insertar rostro en Word: {e_img}")
 
         datos = req.datosExtraidos or {}
         dir_data = datos.get("direccion", {})
@@ -636,7 +507,7 @@ def generate_word(req: WordRequest):
         p_disc.paragraph_format.space_before = Pt(25)
         p_disc.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda strictly prohibida la divulgación o difusión de este archivo fuera de la empresa.")
+        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda estrictamente prohibida la divulgación o difusión de este archivo fuera de la empresa.")
         run_disc.font.size = Pt(8.5)
         run_disc.font.italic = True
         run_disc.font.bold = True
@@ -667,7 +538,7 @@ def generate_word(req: WordRequest):
         raise HTTPException(status_code=500, detail=f"Error al generar documento Word: {str(e)}")
 
 
-# --- ENDPOINT 4: OPTIMIZAR PDF ---
+# --- ENDPOINT 3: OPTIMIZAR PDF ---
 @app.post("/optimizar_pdf", response_class=Response)
 def optimizar_pdf(req: OptimizePDFReq):
     try:
@@ -734,7 +605,7 @@ def optimizar_pdf(req: OptimizePDFReq):
         raise HTTPException(status_code=500, detail=f"Error al procesar el PDF: {str(e)}")
 
 
-# --- ENDPOINT 5: BUSCA INVOICE DOOSAN ---
+# --- ENDPOINT 4: BUSCA INVOICE DOOSAN ---
 @app.post("/buscaInvoice")
 def busca_invoice(req: ScrapeRequest):
     today_dt = datetime.now()
@@ -760,7 +631,7 @@ def busca_invoice(req: ScrapeRequest):
         finally: browser.close()
 
 
-# --- ENDPOINT 6: DESCARGA INVOICE DOOSAN ---
+# --- ENDPOINT 5: DESCARGA INVOICE DOOSAN ---
 @app.post("/descargaInvoice")
 def descarga_invoice(req: DownloadRequest):
     today_dt = datetime.now()
@@ -791,7 +662,7 @@ def descarga_invoice(req: DownloadRequest):
         finally: browser.close()
 
 
-# --- ENDPOINT 7: EXTRACT COORDINATES ---
+# --- ENDPOINT 6: EXTRACT COORDINATES ---
 @app.post("/extract_coordinates")
 def get_coordinates(req: CoordinateRequest):
     try:
@@ -807,7 +678,7 @@ def get_coordinates(req: CoordinateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ENDPOINT 8: FIND TEXT COORDS ---
+# --- ENDPOINT 7: FIND TEXT COORDS ---
 @app.post("/find_text_coords")
 def find_text_coords(req: CoordinateRequest):
     try:
@@ -825,7 +696,7 @@ def find_text_coords(req: CoordinateRequest):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ENDPOINT 9: EDIT INCOTERM ---
+# --- ENDPOINT 8: EDIT INCOTERM ---
 @app.post("/edit_incoterm", response_class=Response)
 def edit_incoterm(req: IncotermReq):
     try:
@@ -848,7 +719,7 @@ def edit_incoterm(req: IncotermReq):
         raise HTTPException(status_code=500, detail=f"Error en edit_incoterm: {str(e)}")
 
 
-# --- ENDPOINT 10: EDIT BILLSHIP ---
+# --- ENDPOINT 9: EDIT BILLSHIP ---
 @app.post("/edit_billship", response_class=Response)
 def edit_billship(req: BillShipReq):
     try:
@@ -879,7 +750,7 @@ def edit_billship(req: BillShipReq):
         raise HTTPException(status_code=500, detail=f"Error en edit_billship: {str(e)}")
 
 
-# --- ENDPOINT 11: OVERLAY TEXT BATCH ---
+# --- ENDPOINT 10: OVERLAY TEXT BATCH ---
 @app.post("/overlay_text_batch", response_class=Response)
 def overlay_text_batch(req: CustomBatchReq):
     try:
@@ -904,7 +775,7 @@ def overlay_text_batch(req: CustomBatchReq):
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
-# --- ENDPOINT 12: CUT RANGE (PROTEGIDO EN PROCESO AISLADO CON PROCESSPOOL) ---
+# --- ENDPOINT 11: CUT RANGE ---
 @app.post("/cut_range", response_class=Response)
 def cut_range(req: CutRangeReq):
     try:
@@ -930,7 +801,7 @@ def cut_range(req: CutRangeReq):
         raise HTTPException(status_code=500, detail=f"Error en cut_range: {str(e)}")
 
 
-# --- ENDPOINT 13: EXTRACT CUSTOM PAGES ---
+# --- ENDPOINT 12: EXTRACT CUSTOM PAGES ---
 @app.post("/extract_custom_pages", response_class=Response)
 def extract_custom_pages(req: CustomPagesReq):
     try:
@@ -950,7 +821,7 @@ def extract_custom_pages(req: CustomPagesReq):
         raise HTTPException(status_code=500, detail=f"Error en extract_custom_pages: {str(e)}")
 
 
-# --- ENDPOINT 14: VALIDATE REFERENCE REQUEST ---
+# --- ENDPOINT 13: VALIDATE REFERENCE REQUEST ---
 @app.post("/validate_reference_request")
 def validate_reference_request(req: ReferenceParseReq):
     def normalizar_texto(texto: str) -> str:
@@ -1091,14 +962,9 @@ def validate_reference_request(req: ReferenceParseReq):
         "structure_status": structure_status
     }
 
-# --- ENDPOINT 15: DESCARGAR ARCHIVO LOCAL/ALMACENAMIENTO ---
+# --- ENDPOINT 14: DESCARGAR ARCHIVO LOCAL/ALMACENAMIENTO ---
 @app.get("/descargar_archivo/{filepath:path}")
 def descargar_archivo(filepath: str):
-    """
-    Descarga cualquier archivo almacenado en el microservicio o sus volúmenes.
-    Ejemplo de llamada: GET /descargar_archivo/archivos/mi_documento.pdf
-    O: GET /descargar_archivo/logo_vegusa.png
-    """
     try:
         base_dir = os.path.abspath(os.path.dirname(__file__))
         target_path = os.path.abspath(os.path.join(base_dir, filepath))
@@ -1125,7 +991,7 @@ def descargar_archivo(filepath: str):
         raise HTTPException(status_code=500, detail=f"Error al descargar archivo: {str(e)}")
 
 
-# --- ENDPOINT 16: GENERAR CARTA RESPONSIVA CON PLANTILLA DOCX ---
+# --- ENDPOINT 15: GENERAR CARTA RESPONSIVA CON PLANTILLA DOCX ---
 @app.post("/generar-responsiva", response_class=Response)
 def generar_responsiva(req: ResponsivaReq):
     try:
@@ -1140,7 +1006,6 @@ def generar_responsiva(req: ResponsivaReq):
             )
             
         doc = DocxTemplate(template_path)
-        
         fecha_actual = datetime.now().strftime("%Y-%m-%d")
         
         context = {
@@ -1154,12 +1019,10 @@ def generar_responsiva(req: ResponsivaReq):
             "fecha_documento": fecha_actual,
             "fecha_ingreso": req.fecha_ingreso or "",
             "fecha ingreso": req.fecha_ingreso or "",
-            
             "marca": req.marca or "",
             "modelo": req.modelo or "",
             "procesador": req.procesador or "",
             "serie": req.serie or "",
-            
             "marca_mov": req.marca_mov or "",
             "modelo_mov": req.modelo_mov or "",
             "IMEI": req.IMEI or "",
@@ -1168,15 +1031,12 @@ def generar_responsiva(req: ResponsivaReq):
         }
         
         doc.render(context)
-        
         out_buf = BytesIO()
         doc.save(out_buf)
         docx_bytes = out_buf.getvalue()
         
         nombre_persona_limpio = normalizar_nombre(req.nombre_completo or "Empleado")
         nombre_archivo = f"Responsiva_{tipo.capitalize()}_{nombre_persona_limpio}.docx"
-        
-        print(f">>> [GENERAR RESPONSIVA] Generada responsiva de {tipo} para {req.nombre_completo} (Ticket #{req.numero_ticket})")
 
         return Response(
             content=docx_bytes,
@@ -1196,7 +1056,7 @@ def generar_responsiva(req: ResponsivaReq):
         )
 
 
-# --- ENDPOINT 17: DIAGNÓSTICO DE MEMORIA Y RECURSOS ---
+# --- ENDPOINT 16: DIAGNÓSTICO DE MEMORIA Y RECURSOS ---
 @app.get("/diagnostics")
 def get_diagnostics():
     try:
@@ -1215,10 +1075,9 @@ def get_diagnostics():
         raise HTTPException(status_code=500, detail=f"Error al obtener diagnósticos: {str(e)}")
 
 
-# --- ENDPOINT 18: CONSULTA DE LOGS EN TIEMPO REAL ---
+# --- ENDPOINT 17: CONSULTA DE LOGS EN TIEMPO REAL ---
 @app.get("/logs")
 def get_logs(limit: int = 50):
-    """Retorna las últimas líneas del registro de la consola del contenedor."""
     try:
         logs_list = list(LOG_BUFFER)
         return {
