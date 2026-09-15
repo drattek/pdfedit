@@ -19,6 +19,8 @@ env:
   APP_NAME: pdfedit
   ACR_NAME: pdfeditacr
   IMAGE_REPO: pdfedit
+  CPU: '1.0'
+  MEMORY: 2.0Gi
 
 concurrency:
   group: deploy-pdfedit
@@ -52,7 +54,32 @@ jobs:
           az containerapp update \
             -n "$APP_NAME" -g "$RESOURCE_GROUP" \
             --image "$LOGIN_SERVER/$IMAGE_REPO:$IMAGE_TAG" \
-            --revision-suffix "sha-$IMAGE_TAG"
+            --revision-suffix "sha-$IMAGE_TAG" \
+            --cpu "$CPU" --memory "$MEMORY"
+
+      - name: Esperar a que la revisión nueva arranque
+        run: |
+          REV="$APP_NAME--sha-$IMAGE_TAG"
+          echo "Esperando a que $REV quede Healthy/Running (máx 10 min)..."
+          for i in $(seq 1 60); do
+            read -r HEALTH RUNNING <<< "$(az containerapp revision show \
+              -n "$APP_NAME" -g "$RESOURCE_GROUP" --revision "$REV" \
+              --query '[properties.healthState, properties.runningState]' -o tsv | tr '\t' ' ')"
+            echo "  intento $i: health=$HEALTH running=$RUNNING"
+            if [ "$RUNNING" = "Running" ] && [ "$HEALTH" = "Healthy" ]; then
+              echo "Revisión $REV arriba y saludable."
+              exit 0
+            fi
+            if [ "$RUNNING" = "Failed" ] || [ "$RUNNING" = "Stopped" ]; then
+              break
+            fi
+            sleep 10
+          done
+          echo "::error::La revisión $REV no arrancó (health=$HEALTH running=$RUNNING). Logs del contenedor:"
+          az containerapp logs show -n "$APP_NAME" -g "$RESOURCE_GROUP" \
+            --revision "$REV" --type console --tail 60 || true
+          echo "El tráfico sigue en la última revisión sana."
+          exit 1
 
       - name: Verificar
         run: |
