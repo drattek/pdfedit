@@ -62,9 +62,10 @@ jobs:
           REV="$APP_NAME--sha-$IMAGE_TAG"
           echo "Esperando a que $REV quede Healthy/Running (máx 10 min)..."
           for i in $(seq 1 60); do
-            read -r HEALTH RUNNING <<< "$(az containerapp revision show \
-              -n "$APP_NAME" -g "$RESOURCE_GROUP" --revision "$REV" \
-              --query '[properties.healthState, properties.runningState]' -o tsv | tr '\t' ' ')"
+            read -r HEALTH RUNNING <<< "$(az containerapp revision list \
+              -n "$APP_NAME" -g "$RESOURCE_GROUP" \
+              --query "[?name=='$REV'].[properties.healthState, properties.runningState] | [0]" \
+              -o tsv | tr '\t' ' ')"
             echo "  intento $i: health=$HEALTH running=$RUNNING"
             if [ "$RUNNING" = "Running" ] && [ "$HEALTH" = "Healthy" ]; then
               echo "Revisión $REV arriba y saludable."
