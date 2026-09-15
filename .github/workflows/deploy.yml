@@ -62,21 +62,24 @@ jobs:
           REV="$APP_NAME--sha-$IMAGE_TAG"
           echo "Esperando a que $REV quede Healthy/Running (máx 10 min)..."
           for i in $(seq 1 60); do
-            read -r HEALTH RUNNING <<< "$(az containerapp revision list \
+            read -r HEALTH PROV RUNNING <<< "$(az containerapp revision list \
               -n "$APP_NAME" -g "$RESOURCE_GROUP" \
-              --query "[?name=='$REV'].[properties.healthState, properties.runningState] | [0]" \
+              --query "[?name=='$REV'].[properties.healthState, properties.provisioningState, properties.runningState] | [0]" \
               -o tsv | tr '\t' ' ')"
-            echo "  intento $i: health=$HEALTH running=$RUNNING"
-            if [ "$RUNNING" = "Running" ] && [ "$HEALTH" = "Healthy" ]; then
+            echo "  intento $i: health=$HEALTH provisioning=$PROV running=$RUNNING"
+            # runningState puede venir vacío según la versión de la extensión containerapp
+            if [ "$HEALTH" = "Healthy" ] && [ "$PROV" = "Provisioned" ] \
+               && { [ -z "$RUNNING" ] || [ "$RUNNING" = "Running" ] || [ "$RUNNING" = "RunningAtMaxScale" ]; }; then
               echo "Revisión $REV arriba y saludable."
               exit 0
             fi
-            if [ "$RUNNING" = "Failed" ] || [ "$RUNNING" = "Stopped" ]; then
+            if [ "$HEALTH" = "Unhealthy" ] || [ "$PROV" = "Failed" ] \
+               || [ "$RUNNING" = "Failed" ] || [ "$RUNNING" = "Stopped" ]; then
               break
             fi
             sleep 10
           done
-          echo "::error::La revisión $REV no arrancó (health=$HEALTH running=$RUNNING). Logs del contenedor:"
+          echo "::error::La revisión $REV no arrancó (health=$HEALTH provisioning=$PROV running=$RUNNING). Logs del contenedor:"
           az containerapp logs show -n "$APP_NAME" -g "$RESOURCE_GROUP" \
             --revision "$REV" --type console --tail 60 || true
           echo "El tráfico sigue en la última revisión sana."
