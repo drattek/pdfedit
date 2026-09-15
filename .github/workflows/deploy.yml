@@ -39,6 +39,9 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Actualizar extensión containerapp
+        run: az extension add --upgrade -n containerapp -y
+
       - name: Build y push de la imagen en ACR
         run: |
           TAG="${GITHUB_SHA::8}"
