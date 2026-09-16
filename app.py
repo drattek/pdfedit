@@ -66,7 +66,6 @@ import base64
 import time
 import re
 import unicodedata
-import urllib.request
 import pdfplumber
 from playwright.sync_api import sync_playwright
 from reportlab.pdfgen import canvas
@@ -91,10 +90,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.00 - Depuración Completa Extracción Facial y Optimización de Memoria"
+VERSION = "2.13 - Fixed Binary Responses with Content-Length & Connection Close"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Sin módulo facial / Máximo rendimiento)")
+print(f" MODO: Producción n8n (Socket Safety + Content-Length Headers)")
 print(f"{'='*40}\n")
 
 # Pool de procesos aislados para evitar que fallos de C derriben el servidor principal
@@ -125,6 +124,34 @@ try:
         print(f"\n>>> [LOGO VEGUSA] Aviso: No se encontró 'logo_vegusa.png' en: {LOGO_PATH}")
 except Exception as e:
     print(f"\n>>> [LOGO VEGUSA] Error al cargar la imagen: {str(e)}")
+
+
+# ---------------------------------------------------------
+# HELPER CENTRALIZADO PARA RESPUESTAS BINARIAS SEGURAS
+# ---------------------------------------------------------
+def pdf_response(pdf_bytes: bytes, filename: str = "documento.pdf") -> Response:
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Length": str(len(pdf_bytes)),
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Connection": "close",
+            "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
+        }
+    )
+
+def docx_response(docx_bytes: bytes, filename: str = "documento.docx") -> Response:
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Length": str(len(docx_bytes)),
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Connection": "close",
+            "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
+        }
+    )
 
 
 # ---------------------------------------------------------
@@ -254,7 +281,21 @@ def _export(writer: PdfWriter) -> bytes:
     return out.getvalue()
 
 def _worker_cut_range(raw_bytes: bytes, start_page: int, final_page: int) -> bytes:
+    """Intenta recortar usando PyPDF2 primero (Python puro, sin riesgo de SegFault)."""
     try:
+        reader = PdfReader(BytesIO(raw_bytes))
+        writer = PdfWriter()
+        total = len(reader.pages)
+        
+        start = max(0, min(start_page, total - 1))
+        end = max(start, min(final_page, total - 1))
+        
+        for i in range(start, end + 1):
+            writer.add_page(reader.pages[i])
+            
+        return _export(writer)
+    except Exception:
+        # Fallback secundario a PyMuPDF si PyPDF2 no puede abrir el stream
         doc = fitz.open(stream=raw_bytes, filetype="pdf")
         total = len(doc)
         start = max(0, min(start_page, total - 1))
@@ -264,15 +305,6 @@ def _worker_cut_range(raw_bytes: bytes, start_page: int, final_page: int) -> byt
         out_bytes = doc.tobytes()
         doc.close()
         return out_bytes
-    except Exception:
-        reader = PdfReader(BytesIO(raw_bytes))
-        writer = PdfWriter()
-        total = len(reader.pages)
-        start = max(0, min(start_page, total - 1))
-        end = max(start, min(final_page, total - 1))
-        for i in range(start, end + 1):
-            writer.add_page(reader.pages[i])
-        return _export(writer)
 
 def _overlay_rect_with_text_fitz(
     pdf_bytes: bytes,
@@ -430,14 +462,7 @@ def generate_pdf(req: PDFRequest):
         else:
             filename_final = f"{prefijo_limpio}_{razon_limpia}.pdf"
             
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename_final}",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
+        return pdf_response(pdf_bytes, filename_final)
     except Exception as e:
         print(f">>> [ERROR GENERATE-PDF]: {str(e)}")
         raise HTTPException(
@@ -522,17 +547,9 @@ def generate_word(req: WordRequest):
         
         nombre_limpio = normalizar_nombre(nombre_base)
         prefijo_limpio = normalizar_nombre(req.prefijo or "Identificacion")
-        
         filename_final = f"{prefijo_limpio}_{nombre_limpio}.docx"
 
-        return Response(
-            content=docx_bytes,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename_final}",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
+        return docx_response(docx_bytes, filename_final)
     except Exception as e:
         print(f">>> [ERROR GENERATE-WORD]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error al generar documento Word: {str(e)}")
@@ -593,14 +610,7 @@ def optimizar_pdf(req: OptimizePDFReq):
         nombre_seguro = normalizar_nombre(nombre_original)
         if not nombre_seguro.endswith(".pdf"): nombre_seguro += ".pdf"
 
-        return Response(
-            content=pdf_data,
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename={nombre_seguro}",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
+        return pdf_response(pdf_data, nombre_seguro)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al procesar el PDF: {str(e)}")
 
@@ -701,19 +711,16 @@ def find_text_coords(req: CoordinateRequest):
 def edit_incoterm(req: IncotermReq):
     try:
         raw_bytes = base64.b64decode(req.file_b64)
-        if req.incoterm_change and req.area:
-            final_pdf = _overlay_rect_with_text_fitz(
-                raw_bytes,
-                req.area,
-                req.incoterm_text,
-                font_size=req.font_size or 7.0,
-                leading=req.leading or 9.0,
-                debug_outline=req.debug_outline or False
-            )
-        else:
-            final_pdf = raw_bytes
+        final_pdf = _overlay_rect_with_text_fitz(
+            raw_bytes,
+            req.area,
+            req.incoterm_text,
+            font_size=req.font_size or 7.0,
+            leading=req.leading or 9.0,
+            debug_outline=req.debug_outline or False
+        ) if (req.incoterm_change and req.area) else raw_bytes
 
-        return Response(content=final_pdf, media_type="application/pdf")
+        return pdf_response(final_pdf, "incoterm.pdf")
     except Exception as e:
         print(f">>> [ERROR EDIT_INCOTERM FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en edit_incoterm: {str(e)}")
@@ -744,7 +751,7 @@ def edit_billship(req: BillShipReq):
                 debug_outline=req.debug_outline or False
             )
 
-        return Response(content=pdf_bytes, media_type="application/pdf")
+        return pdf_response(pdf_bytes, "billship.pdf")
     except Exception as e:
         print(f">>> [ERROR EDIT_BILLSHIP FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en edit_billship: {str(e)}")
@@ -755,32 +762,31 @@ def edit_billship(req: BillShipReq):
 def overlay_text_batch(req: CustomBatchReq):
     try:
         pdf_bytes = base64.b64decode(req.file_b64)
-        if not req.ops:
-            return Response(content=pdf_bytes, media_type="application/pdf")
-        
-        for op in req.ops:
-            pdf_bytes = _overlay_rect_with_text_fitz(
-                pdf_bytes,
-                op.area,
-                op.text,
-                font_size=op.font_size or 9.0,
-                leading=op.leading or 11.0,
-                debug_outline=op.debug_outline or False,
-                font_name=op.font_name or "Helvetica"
-            )
+        if req.ops:
+            for op in req.ops:
+                pdf_bytes = _overlay_rect_with_text_fitz(
+                    pdf_bytes,
+                    op.area,
+                    op.text,
+                    font_size=op.font_size or 9.0,
+                    leading=op.leading or 11.0,
+                    debug_outline=op.debug_outline or False,
+                    font_name=op.font_name or "Helvetica"
+                )
             
-        return Response(content=pdf_bytes, media_type="application/pdf")
+        return pdf_response(pdf_bytes, "overlay.pdf")
     except Exception as e:
         print(f">>> [ERROR OVERLAY_TEXT_BATCH FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
-# --- ENDPOINT 11: CUT RANGE ---
+# --- ENDPOINT 11: CUT RANGE (ASYNCRONO + RECORTE PYPDF2 ANTIFALLAS + AUTO-RECUPERACIÓN) ---
 @app.post("/cut_range", response_class=Response)
 async def cut_range(req: CutRangeReq):
+    global process_executor
     try:
         raw_bytes = base64.b64decode(req.file_b64)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         
         out_bytes = await loop.run_in_executor(
             process_executor,
@@ -789,13 +795,12 @@ async def cut_range(req: CutRangeReq):
             req.start_page,
             req.final_page
         )
-        return Response(content=out_bytes, media_type="application/pdf")
+        return pdf_response(out_bytes, "recorte.pdf")
     except BrokenProcessPool:
-        print(">>> [CRITICAL CUT_RANGE]: Se detectó SegFault de C en subproceso. Reiniciando pool...")
-        raise HTTPException(
-            status_code=500, 
-            detail="Error crítico de C en el procesador PDF. La estructura del PDF colapsó el motor."
-        )
+        print(">>> [CRITICAL CUT_RANGE]: Subproceso colapsado. Reiniciando ProcessPoolExecutor...")
+        process_executor = ProcessPoolExecutor(max_workers=2)
+        out_bytes = _worker_cut_range(base64.b64decode(req.file_b64), req.start_page, req.final_page)
+        return pdf_response(out_bytes, "recorte.pdf")
     except Exception as e:
         print(f">>> [ERROR CUT_RANGE]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en cut_range: {str(e)}")
@@ -815,7 +820,7 @@ def extract_custom_pages(req: CustomPagesReq):
                 
         out_bytes = doc.tobytes()
         doc.close()
-        return Response(content=out_bytes, media_type="application/pdf")
+        return pdf_response(out_bytes, "paginas_extraidas.pdf")
     except Exception as e:
         print(f">>> [ERROR EXTRACT_CUSTOM_PAGES FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en extract_custom_pages: {str(e)}")
@@ -1038,14 +1043,7 @@ def generar_responsiva(req: ResponsivaReq):
         nombre_persona_limpio = normalizar_nombre(req.nombre_completo or "Empleado")
         nombre_archivo = f"Responsiva_{tipo.capitalize()}_{nombre_persona_limpio}.docx"
 
-        return Response(
-            content=docx_bytes,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={
-                "Content-Disposition": f"attachment; filename={nombre_archivo}",
-                "Access-Control-Expose-Headers": "Content-Disposition"
-            }
-        )
+        return docx_response(docx_bytes, nombre_archivo)
     except HTTPException:
         raise
     except Exception as e:
