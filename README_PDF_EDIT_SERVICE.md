@@ -116,9 +116,20 @@ Cada `git push` a la rama `main` dispara el workflow de GitHub Actions
    un token federado por la identidad `pdfedit-github-actions` de Entra ID.
 2. **Build de la imagen en ACR**: `az acr build` en el registro `pdfeditacr`, con dos tags:
    el SHA corto del commit (ej. `pdfedit:a30bc673`) y `latest`.
-3. **Nueva revisión en Container Apps**: `az containerapp update --image ... --revision-suffix sha-<sha>`.
+3. **Nueva revisión en Container Apps**: `az containerapp update --image ... --revision-suffix sha-<sha>`,
+   con la capacidad fijada en el workflow (**1 vCPU / 2 GiB**, variables `CPU`/`MEMORY`).
    La revisión anterior se conserva con 0% de tráfico, por si hay que regresar.
-4. **Verificación**: imprime la URL pública y la tabla de revisiones activas.
+4. **Gate de arranque**: espera hasta 10 min a que la revisión nueva esté `Healthy` + `Running`,
+   consultando el ARM API con `az rest` (la extensión `containerapp` del runner devuelve esos
+   campos vacíos). Si el contenedor no arranca (p. ej. un error de importación en `app.py`),
+   el run se marca **rojo**, imprime los logs del contenedor y el tráfico se queda en la última
+   revisión sana — un deploy roto ya no pasa desapercibido como verde.
+5. **Verificación**: imprime la URL y la tabla de revisiones activas.
+
+**Capacidad**: 1 vCPU / 2 GiB por réplica, 1–2 réplicas (plan Consumption, westus3).
+Costo estimado por réplica siempre encendida: ~$23 USD/mes en reposo, ~$78 USD/mes a uso
+continuo. Para cambiarla, edita `CPU`/`MEMORY` en `.github/workflows/deploy.yml` (el
+siguiente deploy la aplica); un `az containerapp update` manual requiere cuenta con MFA.
 
 Cambios que solo tocan archivos `.md`, `deploy_n8n_aca.py`, `Dockerfile.n8n` o `n8n_outlook/`
 **no** disparan el deploy.
