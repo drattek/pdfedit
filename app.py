@@ -84,10 +84,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.14 - Eliminación de ProcessPoolExecutor (Fix Deadlock de Linux)"
+VERSION = "2.15 - Fix Keep-Alive Socket Closure (Removal of Connection Close)"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Procesamiento directo ultra-rápido en ThreadPool)")
+print(f" MODO: Producción n8n (Keep-Alive TCP Safety)")
 print(f"{'='*40}\n")
 
 app = FastAPI(title=f"PDF Edit & Doosan Service v{VERSION} — Vegusa Enterprise")
@@ -127,7 +127,6 @@ def pdf_response(pdf_bytes: bytes, filename: str = "documento.pdf") -> Response:
         headers={
             "Content-Length": str(len(pdf_bytes)),
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "Connection": "close",
             "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
         }
     )
@@ -139,7 +138,6 @@ def docx_response(docx_bytes: bytes, filename: str = "documento.docx") -> Respon
         headers={
             "Content-Length": str(len(docx_bytes)),
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "Connection": "close",
             "Access-Control-Expose-Headers": "Content-Disposition, Content-Length"
         }
     )
@@ -272,7 +270,6 @@ def _export(writer: PdfWriter) -> bytes:
     return out.getvalue()
 
 def _worker_cut_range(raw_bytes: bytes, start_page: int, final_page: int) -> bytes:
-    """Recorta páginas usando PyPDF2 (Python puro, ultra-rápido y sin riesgo de deadlock)."""
     try:
         reader = PdfReader(BytesIO(raw_bytes))
         writer = PdfWriter()
@@ -770,7 +767,7 @@ def overlay_text_batch(req: CustomBatchReq):
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
-# --- ENDPOINT 11: CUT RANGE (ASYNCRONO DIRECCIONADO A THREADPOOL - FIX DEADLOCK) ---
+# --- ENDPOINT 11: CUT RANGE ---
 @app.post("/cut_range", response_class=Response)
 async def cut_range(req: CutRangeReq):
     global process_executor
