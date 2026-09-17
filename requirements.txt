@@ -7,8 +7,5 @@ PyPDF2==3.0.1
 reportlab==4.0.9
 python-multipart==0.0.9
 Pillow==10.2.0
-PyMuPDF
 python-docx
 docxtpl
-psutil
-numpy
