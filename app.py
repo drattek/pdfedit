@@ -50,12 +50,6 @@ sys.stdout = LogCollector(sys.stdout)
 sys.stderr = LogCollector(sys.stderr)
 
 import asyncio
-from concurrent.futures import ProcessPoolExecutor
-try:
-    from concurrent.futures.process import BrokenProcessPool
-except ImportError:
-    from concurrent.futures import BrokenExecutor as BrokenProcessPool
-
 from fastapi import FastAPI, Response, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -90,14 +84,11 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.13 - Fixed Binary Responses with Content-Length & Connection Close"
+VERSION = "2.14 - Eliminación de ProcessPoolExecutor (Fix Deadlock de Linux)"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Socket Safety + Content-Length Headers)")
+print(f" MODO: Producción n8n (Procesamiento directo ultra-rápido en ThreadPool)")
 print(f"{'='*40}\n")
-
-# Pool de procesos aislados para evitar que fallos de C derriben el servidor principal
-process_executor = ProcessPoolExecutor(max_workers=2)
 
 app = FastAPI(title=f"PDF Edit & Doosan Service v{VERSION} — Vegusa Enterprise")
 
@@ -272,7 +263,7 @@ class ResponsivaReq(BaseModel):
 
 
 # ---------------------------------------------------------
-# WORKERS AISLADOS EN PROCESO INDEPENDIENTE
+# FUNCIONES DE PROCESAMIENTO
 # ---------------------------------------------------------
 
 def _export(writer: PdfWriter) -> bytes:
@@ -281,7 +272,7 @@ def _export(writer: PdfWriter) -> bytes:
     return out.getvalue()
 
 def _worker_cut_range(raw_bytes: bytes, start_page: int, final_page: int) -> bytes:
-    """Intenta recortar usando PyPDF2 primero (Python puro, sin riesgo de SegFault)."""
+    """Recorta páginas usando PyPDF2 (Python puro, ultra-rápido y sin riesgo de deadlock)."""
     try:
         reader = PdfReader(BytesIO(raw_bytes))
         writer = PdfWriter()
@@ -295,7 +286,6 @@ def _worker_cut_range(raw_bytes: bytes, start_page: int, final_page: int) -> byt
             
         return _export(writer)
     except Exception:
-        # Fallback secundario a PyMuPDF si PyPDF2 no puede abrir el stream
         doc = fitz.open(stream=raw_bytes, filetype="pdf")
         total = len(doc)
         start = max(0, min(start_page, total - 1))
@@ -780,26 +770,18 @@ def overlay_text_batch(req: CustomBatchReq):
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
-# --- ENDPOINT 11: CUT RANGE (ASYNCRONO + RECORTE PYPDF2 ANTIFALLAS + AUTO-RECUPERACIÓN) ---
+# --- ENDPOINT 11: CUT RANGE (ASYNCRONO DIRECCIONADO A THREADPOOL - FIX DEADLOCK) ---
 @app.post("/cut_range", response_class=Response)
 async def cut_range(req: CutRangeReq):
     global process_executor
     try:
         raw_bytes = base64.b64decode(req.file_b64)
-        loop = asyncio.get_running_loop()
-        
-        out_bytes = await loop.run_in_executor(
-            process_executor,
+        out_bytes = await asyncio.to_thread(
             _worker_cut_range,
             raw_bytes,
             req.start_page,
             req.final_page
         )
-        return pdf_response(out_bytes, "recorte.pdf")
-    except BrokenProcessPool:
-        print(">>> [CRITICAL CUT_RANGE]: Subproceso colapsado. Reiniciando ProcessPoolExecutor...")
-        process_executor = ProcessPoolExecutor(max_workers=2)
-        out_bytes = _worker_cut_range(base64.b64decode(req.file_b64), req.start_page, req.final_page)
         return pdf_response(out_bytes, "recorte.pdf")
     except Exception as e:
         print(f">>> [ERROR CUT_RANGE]: {str(e)}")
