@@ -19,6 +19,8 @@ env:
   APP_NAME: pdfedit
   ACR_NAME: pdfeditacr
   IMAGE_REPO: pdfedit
+  CPU: '1.0'
+  MEMORY: 2.0Gi
 
 concurrency:
   group: deploy-pdfedit
@@ -37,6 +39,9 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Actualizar extensión containerapp
+        run: az extension add --upgrade -n containerapp -y
+
       - name: Build y push de la imagen en ACR
         run: |
           TAG="${GITHUB_SHA::8}"
@@ -52,7 +57,39 @@ jobs:
           az containerapp update \
             -n "$APP_NAME" -g "$RESOURCE_GROUP" \
             --image "$LOGIN_SERVER/$IMAGE_REPO:$IMAGE_TAG" \
-            --revision-suffix "sha-$IMAGE_TAG"
+            --revision-suffix "sha-$IMAGE_TAG" \
+            --cpu "$CPU" --memory "$MEMORY"
+
+      - name: Esperar a que la revisión nueva arranque
+        run: |
+          REV="$APP_NAME--sha-$IMAGE_TAG"
+          SUB=$(az account show --query id -o tsv)
+          # az rest contra el ARM API: la extensión containerapp del runner omite
+          # provisioningState/runningState, la API siempre los trae
+          URL="https://management.azure.com/subscriptions/$SUB/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$APP_NAME/revisions/$REV?api-version=2024-03-01"
+          echo "Esperando a que $REV quede Healthy/Running (máx 10 min)..."
+          for i in $(seq 1 60); do
+            JSON=$(az rest --method get --url "$URL" --query 'properties.{h:healthState,p:provisioningState,r:runningState}' -o json 2>/dev/null || echo '{}')
+            HEALTH=$(echo "$JSON" | jq -r '.h // empty')
+            PROV=$(echo "$JSON" | jq -r '.p // empty')
+            RUNNING=$(echo "$JSON" | jq -r '.r // empty')
+            echo "  intento $i: health=$HEALTH provisioning=$PROV running=$RUNNING"
+            if [ "$HEALTH" = "Healthy" ] && [ "$PROV" = "Provisioned" ] \
+               && { [ "$RUNNING" = "Running" ] || [ "$RUNNING" = "RunningAtMaxScale" ]; }; then
+              echo "Revisión $REV arriba y saludable."
+              exit 0
+            fi
+            if [ "$HEALTH" = "Unhealthy" ] || [ "$PROV" = "Failed" ] \
+               || [ "$RUNNING" = "Failed" ] || [ "$RUNNING" = "Stopped" ]; then
+              break
+            fi
+            sleep 10
+          done
+          echo "::error::La revisión $REV no arrancó (health=$HEALTH provisioning=$PROV running=$RUNNING). Logs del contenedor:"
+          az containerapp logs show -n "$APP_NAME" -g "$RESOURCE_GROUP" \
+            --revision "$REV" --type console --tail 60 || true
+          echo "El tráfico sigue en la última revisión sana."
+          exit 1
 
       - name: Verificar
         run: |
