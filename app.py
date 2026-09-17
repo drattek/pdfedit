@@ -18,76 +18,38 @@ INSTRUCCIONES PERMANENTES PARA IA / GEMINI (DIRECTIVAS DE EDICIÓN QUIRÚRGICA)
 
 import os
 import sys
-from collections import deque
 from datetime import datetime, timedelta
-
-# --- BLOQUEO DE COMPETENCIA DE HILOS EN C (PREVENCIÓN SIGSEGV EN LINUX) ---
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-# =========================================================
-# RECOLECTOR DE LOGS EN MEMORIA PARA N8N
-# =========================================================
-LOG_BUFFER = deque(maxlen=200)
-
-class LogCollector:
-    def __init__(self, stream):
-        self.stream = stream
-
-    def write(self, message):
-        self.stream.write(message)
-        if message.strip():
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            LOG_BUFFER.append(f"[{timestamp}] {message.strip()}")
-
-    def flush(self):
-        self.stream.flush()
-
-sys.stdout = LogCollector(sys.stdout)
-sys.stderr = LogCollector(sys.stderr)
-
-import asyncio
-from fastapi import FastAPI, Response, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List
 from io import BytesIO
 import base64
 import time
 import re
 import unicodedata
+from typing import Optional, List
+
+from fastapi import FastAPI, Response, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
 import pdfplumber
 from playwright.sync_api import sync_playwright
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import white, black
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from PyPDF2 import PdfReader, PdfWriter
-
-# --- DIAGNÓSTICO Y MONITOREO DE SISTEMA ---
-import psutil
-
-# --- COMPRESORES GRÁFICOS DE ALTA DENSIDAD ---
 from PIL import Image
 from reportlab.lib.utils import ImageReader
 
-import fitz  # PyMuPDF
-import numpy as np
-
-# --- GENERADOR DE DOCUMENTOS WORD Y PLANTILLAS ---
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.15 - Fix Keep-Alive Socket Closure (Removal of Connection Close)"
+VERSION = "2.16 - Fusión v1.44 (PyPDF2 Nativo Estilizado) + v2.15 (Sin Logs/Diagnostics)"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
-print(f" MODO: Producción n8n (Keep-Alive TCP Safety)")
+print(f" MODO: Producción n8n (Motor Ligero PyPDF2 + Cabeceras TCP Seguras)")
 print(f"{'='*40}\n")
 
 app = FastAPI(title=f"PDF Edit & Doosan Service v{VERSION} — Vegusa Enterprise")
@@ -261,87 +223,80 @@ class ResponsivaReq(BaseModel):
 
 
 # ---------------------------------------------------------
-# FUNCIONES DE PROCESAMIENTO
+# UTILIDADES INTERNAS PDF (PyPDF2 + ReportLab - v1.44/v1.70)
 # ---------------------------------------------------------
+
+def _load_pdf_from_b64(file_b64: str) -> PdfReader:
+    raw = base64.b64decode(file_b64)
+    return PdfReader(BytesIO(raw))
 
 def _export(writer: PdfWriter) -> bytes:
     out = BytesIO()
     writer.write(out)
     return out.getvalue()
 
-def _worker_cut_range(raw_bytes: bytes, start_page: int, final_page: int) -> bytes:
-    try:
-        reader = PdfReader(BytesIO(raw_bytes))
-        writer = PdfWriter()
-        total = len(reader.pages)
-        
-        start = max(0, min(start_page, total - 1))
-        end = max(start, min(final_page, total - 1))
-        
-        for i in range(start, end + 1):
-            writer.add_page(reader.pages[i])
-            
-        return _export(writer)
-    except Exception:
-        doc = fitz.open(stream=raw_bytes, filetype="pdf")
-        total = len(doc)
-        start = max(0, min(start_page, total - 1))
-        end = max(start, min(final_page, total - 1))
-        
-        doc.select(list(range(start, end + 1)))
-        out_bytes = doc.tobytes()
-        doc.close()
-        return out_bytes
+def _make_overlay(page_width: float, page_height: float, draw_ops):
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_width, page_height))
+    draw_ops(c)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf
 
-def _overlay_rect_with_text_fitz(
-    pdf_bytes: bytes,
+def _overlay_rect_with_text(
+    reader: PdfReader,
+    writer: PdfWriter,
     rect: Rect,
     text: str,
+    font_name: str = "Helvetica",
     font_size: float = 9.0,
     leading: float = 11.0,
-    debug_outline: bool = False,
-    font_name: str = "Helvetica"
-) -> bytes:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page_index = max(0, min(rect.page, len(doc) - 1))
-    page = doc.load_page(page_index)
-    page_height = page.rect.height
+    debug_outline: bool = False
+):
+    page_index = max(0, min(rect.page, len(reader.pages) - 1))
+    page = reader.pages[page_index]
+    media = page.mediabox
+    pw, ph = float(media.width), float(media.height)
 
-    fitz_rect = fitz.Rect(
-        rect.x, 
-        page_height - rect.y - rect.h, 
-        rect.x + rect.w, 
-        page_height - rect.y
-    )
+    def draw_ops(c):
+        if debug_outline:
+            c.setStrokeColorRGB(1, 0, 0)
+            c.setLineWidth(1.2)
+            c.rect(rect.x, rect.y, rect.w, rect.h, fill=False, stroke=True)
+            return
+        c.setFillColor(white)
+        c.rect(rect.x, rect.y, rect.w, rect.h, fill=True, stroke=False)
+        c.setFillColor(black)
+        c.setFont(font_name, font_size)
+        x, y = rect.x + 2, rect.y + rect.h - leading
+        max_w = rect.w - 4
+        
+        for line in (text or '').split("\n"):
+            words = line.split(" ")
+            cur = ""
+            for w in words:
+                test = (cur + " " + w).strip() if cur else w
+                if stringWidth(test, font_name, font_size) <= max_w:
+                    cur = test
+                else:
+                    c.drawString(x, y, cur)
+                    y -= leading
+                    cur = w
+                    if y < rect.y + 2: return
+            if y >= rect.y + 2:
+                c.drawString(x, y, cur)
+                y -= leading
 
-    if debug_outline:
-        page.draw_rect(fitz_rect, color=(1, 0, 0), width=1)
-    else:
-        page.draw_rect(fitz_rect, color=(1, 1, 1), fill=(1, 1, 1))
+    overlay_reader = PdfReader(_make_overlay(pw, ph, draw_ops))
+    page.merge_page(overlay_reader.pages[0])
+    for i, p in enumerate(reader.pages):
+        writer.add_page(page if i == page_index else p)
 
-        fname = "helv"
-        if "bold" in (font_name or "").lower():
-            fname = "hebo"
 
-        lines = (text or "").split("\n")
-        x0 = rect.x + 1
-        y_baseline = (page_height - rect.y - rect.h) + (font_size * 0.85)
-
-        for line in lines:
-            if line.strip():
-                page.insert_text(
-                    fitz.Point(x0, y_baseline),
-                    line,
-                    fontsize=font_size,
-                    fontname=fname,
-                    color=(0, 0, 0)
-                )
-            y_baseline += leading if leading > 0 else (font_size + 2)
-
-    out_bytes = doc.tobytes()
-    doc.close()
-    return out_bytes
-
+# ---------------------------------------------------------
+# UTILIDADES DOOSAN (Navegación Playwright)
+# ---------------------------------------------------------
 
 class AuthException(Exception):
     pass
@@ -519,7 +474,7 @@ def generate_word(req: WordRequest):
         p_disc.paragraph_format.space_before = Pt(25)
         p_disc.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda estrictamente prohibida la divulgación o difusión de este archivo fuera de la empresa.")
+        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda strictly prohibida la divulgación o difusión de este archivo fuera de la empresa.")
         run_disc.font.size = Pt(8.5)
         run_disc.font.italic = True
         run_disc.font.bold = True
@@ -659,7 +614,7 @@ def descarga_invoice(req: DownloadRequest):
         finally: browser.close()
 
 
-# --- ENDPOINT 6: EXTRACT COORDINATES ---
+# --- ENDPOINT 6: EXTRACT COORDINATES (v1.44 / v1.70 PyPDF2) ---
 @app.post("/extract_coordinates")
 def get_coordinates(req: CoordinateRequest):
     try:
@@ -675,7 +630,7 @@ def get_coordinates(req: CoordinateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ENDPOINT 7: FIND TEXT COORDS ---
+# --- ENDPOINT 7: FIND TEXT COORDS (v1.44 / v1.70 PyPDF2) ---
 @app.post("/find_text_coords")
 def find_text_coords(req: CoordinateRequest):
     try:
@@ -693,115 +648,91 @@ def find_text_coords(req: CoordinateRequest):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ENDPOINT 8: EDIT INCOTERM ---
+# --- ENDPOINT 8: EDIT INCOTERM (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
 @app.post("/edit_incoterm", response_class=Response)
 def edit_incoterm(req: IncotermReq):
     try:
-        raw_bytes = base64.b64decode(req.file_b64)
-        final_pdf = _overlay_rect_with_text_fitz(
-            raw_bytes,
-            req.area,
-            req.incoterm_text,
-            font_size=req.font_size or 7.0,
-            leading=req.leading or 9.0,
-            debug_outline=req.debug_outline or False
-        ) if (req.incoterm_change and req.area) else raw_bytes
-
-        return pdf_response(final_pdf, "incoterm.pdf")
+        reader = _load_pdf_from_b64(req.file_b64)
+        writer = PdfWriter()
+        if req.incoterm_change and req.area:
+            _overlay_rect_with_text(reader, writer, req.area, req.incoterm_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
+        else:
+            for p in reader.pages: writer.add_page(p)
+        return pdf_response(_export(writer), "incoterm.pdf")
     except Exception as e:
-        print(f">>> [ERROR EDIT_INCOTERM FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en edit_incoterm: {str(e)}")
 
 
-# --- ENDPOINT 9: EDIT BILLSHIP ---
+# --- ENDPOINT 9: EDIT BILLSHIP (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
 @app.post("/edit_billship", response_class=Response)
 def edit_billship(req: BillShipReq):
     try:
-        pdf_bytes = base64.b64decode(req.file_b64)
+        reader = _load_pdf_from_b64(req.file_b64)
+        writer = PdfWriter()
         bill_area = req.bill_to_area or Rect(page=0, x=72, y=560, w=220, h=80)
         ship_area = req.ship_to_area or Rect(page=0, x=300, y=560, w=250, h=80)
-
+        
         if req.bill_to_text and req.bill_to_area:
-            pdf_bytes = _overlay_rect_with_text_fitz(
-                pdf_bytes, 
-                bill_area, 
-                req.bill_to_text, 
-                font_size=req.font_size or 7.0,
-                debug_outline=req.debug_outline or False
-            )
+            _overlay_rect_with_text(reader, writer, bill_area, req.bill_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
         if req.ship_to_text and req.ship_to_area:
-            pdf_bytes = _overlay_rect_with_text_fitz(
-                pdf_bytes, 
-                ship_area, 
-                req.ship_to_text, 
-                font_size=req.font_size or 7.0,
-                debug_outline=req.debug_outline or False
-            )
-
-        return pdf_response(pdf_bytes, "billship.pdf")
+            _overlay_rect_with_text(reader, writer, ship_area, req.ship_to_text, font_size=req.font_size, leading=req.leading, debug_outline=req.debug_outline)
+            
+        if not writer.pages:
+            for p in reader.pages: writer.add_page(p)
+            
+        return pdf_response(_export(writer), "billship.pdf")
     except Exception as e:
-        print(f">>> [ERROR EDIT_BILLSHIP FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en edit_billship: {str(e)}")
 
 
-# --- ENDPOINT 10: OVERLAY TEXT BATCH ---
+# --- ENDPOINT 10: OVERLAY TEXT BATCH (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
 @app.post("/overlay_text_batch", response_class=Response)
 def overlay_text_batch(req: CustomBatchReq):
     try:
-        pdf_bytes = base64.b64decode(req.file_b64)
-        if req.ops:
-            for op in req.ops:
-                pdf_bytes = _overlay_rect_with_text_fitz(
-                    pdf_bytes,
-                    op.area,
-                    op.text,
-                    font_size=op.font_size or 9.0,
-                    leading=op.leading or 11.0,
-                    debug_outline=op.debug_outline or False,
-                    font_name=op.font_name or "Helvetica"
-                )
-            
-        return pdf_response(pdf_bytes, "overlay.pdf")
+        reader = _load_pdf_from_b64(req.file_b64)
+        if not req.ops:
+            w = PdfWriter()
+            for p in reader.pages: w.add_page(p)
+            return pdf_response(_export(w), "overlay.pdf")
+        for op in req.ops:
+            w = PdfWriter()
+            _overlay_rect_with_text(reader, w, op.area, op.text, font_name=(op.font_name or "Helvetica"), font_size=op.font_size or 9.0, leading=op.leading or 11.0, debug_outline=op.debug_outline or False)
+            reader = PdfReader(BytesIO(_export(w)))
+        final_writer = PdfWriter()
+        for p in reader.pages: final_writer.add_page(p)
+        return pdf_response(_export(final_writer), "overlay.pdf")
     except Exception as e:
-        print(f">>> [ERROR OVERLAY_TEXT_BATCH FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
-# --- ENDPOINT 11: CUT RANGE ---
+# --- ENDPOINT 11: CUT RANGE (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
 @app.post("/cut_range", response_class=Response)
-async def cut_range(req: CutRangeReq):
-    global process_executor
+def cut_range(req: CutRangeReq):
     try:
-        raw_bytes = base64.b64decode(req.file_b64)
-        out_bytes = await asyncio.to_thread(
-            _worker_cut_range,
-            raw_bytes,
-            req.start_page,
-            req.final_page
-        )
-        return pdf_response(out_bytes, "recorte.pdf")
+        reader = _load_pdf_from_b64(req.file_b64)
+        writer = PdfWriter()
+        total = len(reader.pages)
+        start = max(0, min(req.start_page, total - 1))
+        end = max(start, min(req.final_page, total - 1))
+        for i in range(start, end + 1):
+            writer.add_page(reader.pages[i])
+        return pdf_response(_export(writer), "recorte.pdf")
     except Exception as e:
-        print(f">>> [ERROR CUT_RANGE]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en cut_range: {str(e)}")
 
 
-# --- ENDPOINT 12: EXTRACT CUSTOM PAGES ---
+# --- ENDPOINT 12: EXTRACT CUSTOM PAGES (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
 @app.post("/extract_custom_pages", response_class=Response)
 def extract_custom_pages(req: CustomPagesReq):
     try:
-        raw_bytes = base64.b64decode(req.file_b64)
-        doc = fitz.open(stream=raw_bytes, filetype="pdf")
-        total = len(doc)
-        
-        valid_pages = [p for p in req.pages if 0 <= p < total]
-        if valid_pages:
-            doc.select(valid_pages)
-                
-        out_bytes = doc.tobytes()
-        doc.close()
-        return pdf_response(out_bytes, "paginas_extraidas.pdf")
+        reader = _load_pdf_from_b64(req.file_b64)
+        writer = PdfWriter()
+        total = len(reader.pages)
+        for p_num in req.pages:
+            if 0 <= p_num < total:
+                writer.add_page(reader.pages[p_num])
+        return pdf_response(_export(writer), "paginas_extraidas.pdf")
     except Exception as e:
-        print(f">>> [ERROR EXTRACT_CUSTOM_PAGES FITZ]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en extract_custom_pages: {str(e)}")
 
 
@@ -946,6 +877,7 @@ def validate_reference_request(req: ReferenceParseReq):
         "structure_status": structure_status
     }
 
+
 # --- ENDPOINT 14: DESCARGAR ARCHIVO LOCAL/ALMACENAMIENTO ---
 @app.get("/descargar_archivo/{filepath:path}")
 def descargar_archivo(filepath: str):
@@ -1031,40 +963,6 @@ def generar_responsiva(req: ResponsivaReq):
             status_code=500, 
             detail=f"Error al procesar la plantilla Word de la carta responsiva: {str(e)}"
         )
-
-
-# --- ENDPOINT 16: DIAGNÓSTICO DE MEMORIA Y RECURSOS ---
-@app.get("/diagnostics")
-def get_diagnostics():
-    try:
-        mem = psutil.virtual_memory()
-        proc = psutil.Process(os.getpid())
-        return {
-            "status": "success",
-            "version": VERSION,
-            "container_total_ram_mb": round(mem.total / (1024 * 1024), 2),
-            "container_available_ram_mb": round(mem.available / (1024 * 1024), 2),
-            "container_ram_used_pct": mem.percent,
-            "python_process_ram_mb": round(proc.memory_info().rss / (1024 * 1024), 2),
-            "cpu_percent": psutil.cpu_percent(interval=0.2)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al obtener diagnósticos: {str(e)}")
-
-
-# --- ENDPOINT 17: CONSULTA DE LOGS EN TIEMPO REAL ---
-@app.get("/logs")
-def get_logs(limit: int = 50):
-    try:
-        logs_list = list(LOG_BUFFER)
-        return {
-            "status": "success",
-            "version": VERSION,
-            "total_lines": len(logs_list),
-            "logs": logs_list[-limit:]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al consultar logs: {str(e)}")
 
 
 if __name__ == "__main__":
