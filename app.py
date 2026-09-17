@@ -773,6 +773,7 @@ def overlay_text_batch(req: CustomBatchReq):
 # --- ENDPOINT 11: CUT RANGE (ASYNCRONO DIRECCIONADO A THREADPOOL - FIX DEADLOCK) ---
 @app.post("/cut_range", response_class=Response)
 async def cut_range(req: CutRangeReq):
+    global process_executor
     try:
         raw_bytes = base64.b64decode(req.file_b64)
         out_bytes = await asyncio.to_thread(
