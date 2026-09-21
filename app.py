@@ -46,7 +46,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.16 - Fusión v1.44 (PyPDF2 Nativo Estilizado) + v2.15 (Sin Logs/Diagnostics)"
+VERSION = "2.16.1 - Base 2.16 Pura (Sin fitz/psutil) + Búsqueda Avanzada de Clientes y Agencias"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Motor Ligero PyPDF2 + Cabeceras TCP Seguras)")
@@ -223,7 +223,7 @@ class ResponsivaReq(BaseModel):
 
 
 # ---------------------------------------------------------
-# UTILIDADES INTERNAS PDF (PyPDF2 + ReportLab - v1.44/v1.70)
+# UTILIDADES INTERNAS PDF (PyPDF2 + ReportLab)
 # ---------------------------------------------------------
 
 def _load_pdf_from_b64(file_b64: str) -> PdfReader:
@@ -660,6 +660,7 @@ def edit_incoterm(req: IncotermReq):
             for p in reader.pages: writer.add_page(p)
         return pdf_response(_export(writer), "incoterm.pdf")
     except Exception as e:
+        print(f">>> [ERROR EDIT_INCOTERM]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en edit_incoterm: {str(e)}")
 
 
@@ -682,6 +683,7 @@ def edit_billship(req: BillShipReq):
             
         return pdf_response(_export(writer), "billship.pdf")
     except Exception as e:
+        print(f">>> [ERROR EDIT_BILLSHIP]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en edit_billship: {str(e)}")
 
 
@@ -702,6 +704,7 @@ def overlay_text_batch(req: CustomBatchReq):
         for p in reader.pages: final_writer.add_page(p)
         return pdf_response(_export(final_writer), "overlay.pdf")
     except Exception as e:
+        print(f">>> [ERROR OVERLAY_TEXT_BATCH]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
@@ -733,6 +736,7 @@ def extract_custom_pages(req: CustomPagesReq):
                 writer.add_page(reader.pages[p_num])
         return pdf_response(_export(writer), "paginas_extraidas.pdf")
     except Exception as e:
+        print(f">>> [ERROR EXTRACT_CUSTOM_PAGES]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en extract_custom_pages: {str(e)}")
 
 
@@ -750,60 +754,7 @@ def validate_reference_request(req: ReferenceParseReq):
     cuerpo = normalizar_texto(req.body)
     texto_completo = f"{asunto} {cuerpo}"
 
-    id_tipo = None
-    id_valor = None
-
-    cliente_match = re.search(r'\b(CLIENTE|NO\.?\s*CLIENTE|NUMERO\s*DE?\s*CLIENTE)\b.{0,8}?([0-9]{4,6})\b', texto_completo)
-    rfc_prefix = re.search(r'\bRFC\s*[:\-\s]\s*([A-Z0-9\-\s]{10,16})\b', texto_completo)
-    curp_prefix = re.search(r'\bCURP\s*[:\-\s]\s*([A-Z0-9\-\s]{18,22})\b', texto_completo)
-
-    if cliente_match:
-        id_tipo = "NUMERO_CLIENTE"
-        id_valor = cliente_match.group(2).strip()
-    elif rfc_prefix:
-        id_tipo = "RFC"
-        id_valor = re.sub(r'[\s\-]', '', rfc_prefix.group(1))
-    elif curp_prefix:
-        id_tipo = "CURP"
-        id_valor = re.sub(r'[\s\-]', '', curp_prefix.group(1))
-    else:
-        curp_prefix = re.search(r'\bCURP\s*[:\-\s]*([A-Z0-9]{18})\b', texto_completo)
-        rfc_prefix = re.search(r'\bRFC\s*[:\-\s]*([A-Z0-9]{12,13})\b', texto_completo)
-
-        if rfc_prefix:
-            id_tipo = "RFC"
-            id_valor = rfc_prefix.group(1).strip()
-        elif curp_prefix:
-            id_tipo = "CURP"
-            id_valor = curp_prefix.group(1).strip()
-        else:
-            rfc_lenient = re.search(r'\b[A-Z&Ñ]{3,4}[0-9]{6}[A-Z0-9]{3}\b', texto_completo)
-            curp_lenient = re.search(r'\b[A-Z&Ñ]{4}[0-9]{6}[A-Z0-9]{8}\b', texto_completo)
-            
-            if rfc_lenient:
-                id_tipo = "RFC"
-                id_valor = rfc_lenient.group(0)
-            elif curp_lenient:
-                id_tipo = "CURP"
-                id_valor = curp_lenient.group(0)
-
-    if id_tipo:
-        RFC_STRICT = r'^[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{3}$'
-        CURP_STRICT = r'^[A-Z][AEIOUX][A-Z]{2}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM][A-Z]{2}[B-DF-HJ-NP-TV-XYZ]{3}[0-9A-Z][0-9]$'
-        CLIENTE_STRICT = r'^[0-9]{4,6}$'
-
-        is_valid = False
-        if id_tipo == "NUMERO_CLIENTE":
-            is_valid = bool(re.match(CLIENTE_STRICT, id_valor))
-        elif id_tipo == "RFC":
-            is_valid = bool(re.match(RFC_STRICT, id_valor))
-        elif id_tipo == "CURP":
-            is_valid = bool(re.match(CURP_STRICT, id_valor))
-
-        structure_status = "Válida" if is_valid else "Estructura no válida"
-    else:
-        structure_status = "No encontrado"
-
+    # 1. BÚSQUEDA DE SUCURSAL / AGENCIA (SIEMPRE SE EJECUTA PRIMERO)
     mapeo_sucursales = {
         "Villas": [r"\bVILLAS?\b", r"\b331\b"],
         "San Miguel de Allende": [r"\bSAN\s+MIGUEL\b", r"\bSAN\s+MIGUEL\s+DE\s+ALLENDE\b", r"\b135\b", r"\bSMA\b"],
@@ -849,6 +800,82 @@ def validate_reference_request(req: ReferenceParseReq):
 
     branch_result = sucursal_encontrada if sucursal_encontrada else "GENERAL"
 
+    # 2. BÚSQUEDA DE IDENTIFICADOR (NUMERO_CLIENTE, RFC, CURP)
+    id_tipo = None
+    id_valor = None
+
+    # Búsqueda multi-patrón completa para número de cliente, RFC o CURP
+    cliente_match = re.search(
+        r'(?:\b(?:NO\.?|NUM\.?|NUMERO|N0\.?|N[°º]\.?|CLAVE|CVE|CODIGO|COD|ID)?\s*(?:DE\s*)?(?:CLIENTE|CTE|CLIE|IDCLIENTE)\b'
+        r'|'
+        r'\b(?:CLIENTE|CTE|CLIE|IDCLIENTE)\s*(?:DE\s*)?(?:NO\.?|NUM\.?|NUMERO|N0\.?|N[°º]\.?|CLAVE|CVE|CODIGO|COD|ID)?\b'
+        r'|'
+        r'#\s*(?:DE\s*)?(?:CLIENTE|CTE|CLIE)\b'
+        r')'
+        r'[\s:#\.-]*([0-9]{1,6})\b',
+        texto_completo
+    )
+
+    rfc_prefix = re.search(r'\bRFC\s*[:\-\s]\s*([A-Z0-9\-\s]{10,16})\b', texto_completo)
+    curp_prefix = re.search(r'\bCURP\s*[:\-\s]\s*([A-Z0-9\-\s]{18,22})\b', texto_completo)
+
+    if cliente_match:
+        id_tipo = "NUMERO_CLIENTE"
+        id_valor = cliente_match.group(1).strip()
+    elif rfc_prefix:
+        id_tipo = "RFC"
+        id_valor = re.sub(r'[\s\-]', '', rfc_prefix.group(1))
+    elif curp_prefix:
+        id_tipo = "CURP"
+        id_valor = re.sub(r'[\s\-]', '', curp_prefix.group(1))
+    else:
+        # Coincidencias estrictas de RFC y CURP sin prefijos
+        curp_strict_search = re.search(r'\b[A-Z][AEIOUX][A-Z]{2}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM][A-Z]{2}[B-DF-HJ-NP-TV-XYZ]{3}[0-9A-Z][0-9]\b', texto_completo)
+        rfc_strict_search = re.search(r'\b[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{3}\b', texto_completo)
+
+        if rfc_strict_search:
+            id_tipo = "RFC"
+            id_valor = rfc_strict_search.group(0)
+        elif curp_strict_search:
+            id_tipo = "CURP"
+            id_valor = curp_strict_search.group(0)
+        else:
+            # Lista explícita de exclusión: códigos de agencia y códigos postales comunes
+            EXCLUDED_NUMBERS = {"175", "135", "217", "184", "331", "192", "36130", "36540", "36250", "36000", "36500"}
+
+            # Búsqueda de número de cliente independiente (4 a 6 dígitos al inicio o aislado)
+            standalone_numbers = re.finditer(r'\b([0-9]{4,6})\b', texto_completo)
+            for num_m in standalone_numbers:
+                val = num_m.group(1)
+                start_pos = num_m.start()
+                pre_text = texto_completo[max(0, start_pos - 15):start_pos]
+                if re.search(r'\b(C\.?P\.?|TEL|TELS|EXT|DISTR\.?|KM|AGENCIA|SUCURSAL|PLAZA)\b', pre_text):
+                    continue
+                if val in EXCLUDED_NUMBERS:
+                    continue
+                id_tipo = "NUMERO_CLIENTE"
+                id_valor = val
+                break
+
+    # 3. VALIDACIÓN DE ESTRUCTURA Y FORMATO
+    if id_tipo:
+        RFC_STRICT = r'^[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{3}$'
+        CURP_STRICT = r'^[A-Z][AEIOUX][A-Z]{2}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM][A-Z]{2}[B-DF-HJ-NP-TV-XYZ]{3}[0-9A-Z][0-9]$'
+        CLIENTE_STRICT = r'^[0-9]{1,6}$'
+
+        is_valid = False
+        if id_tipo == "NUMERO_CLIENTE":
+            is_valid = bool(re.match(CLIENTE_STRICT, id_valor))
+        elif id_tipo == "RFC":
+            is_valid = bool(re.match(RFC_STRICT, id_valor))
+        elif id_tipo == "CURP":
+            is_valid = bool(re.match(CURP_STRICT, id_valor))
+
+        structure_status = "Válida" if is_valid else "Estructura no válida"
+    else:
+        structure_status = "No encontrado"
+
+    # 4. DEVOLUCIÓN DE RESULTADOS
     if not id_tipo:
         return {
             "status": "rejected",
@@ -873,7 +900,7 @@ def validate_reference_request(req: ReferenceParseReq):
         "status": "approved",
         "search_by": id_tipo,
         "search_value": id_valor,
-        "branch": sucursal_encontrada,
+        "branch": branch_result,
         "structure_status": structure_status
     }
 
