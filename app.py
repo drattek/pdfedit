@@ -24,6 +24,7 @@ import base64
 import time
 import re
 import unicodedata
+from pathlib import Path
 from typing import Optional, List
 
 from fastapi import FastAPI, Response, HTTPException
@@ -45,11 +46,17 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxtpl import DocxTemplate
 
+# --- CONTROL DE RUTAS Y DIRECTORIOS BASE ---
+BASE_DIR = Path(__file__).resolve().parent
+PLANTILLAS_DIR = BASE_DIR / "plantillas"
+
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.16.1 - Base 2.16 Pura (Sin fitz/psutil) + Búsqueda Avanzada de Clientes y Agencias"
+VERSION = "2.18.0 - Catálogo de Equipos (Laptops y Celulares) & Responsivas Automáticas"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Motor Ligero PyPDF2 + Cabeceras TCP Seguras)")
+print(f" RUTA BASE: {BASE_DIR}")
+print(f" RUTA PLANTILLAS: {PLANTILLAS_DIR}")
 print(f"{'='*40}\n")
 
 app = FastAPI(title=f"PDF Edit & Doosan Service v{VERSION} — Vegusa Enterprise")
@@ -66,10 +73,10 @@ app.add_middleware(
 # CARGA DEL LOGO LOCAL
 # =========================================================
 LOGO_B64 = ""
-LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo_vegusa.png")
+LOGO_PATH = BASE_DIR / "logo_vegusa.png"
 
 try:
-    if os.path.exists(LOGO_PATH):
+    if LOGO_PATH.exists():
         with open(LOGO_PATH, "rb") as img_file:
             LOGO_B64 = base64.b64encode(img_file.read()).decode('utf-8')
         print(f"\n>>> [LOGO VEGUSA] ¡Éxito! Imagen cargada ({len(LOGO_B64)} caracteres Base64).")
@@ -425,10 +432,10 @@ def generate_word(req: WordRequest):
             section.left_margin = Inches(0.7)
             section.right_margin = Inches(0.7)
 
-        if os.path.exists(LOGO_PATH):
+        if LOGO_PATH.exists():
             p_logo = doc.add_paragraph()
             p_logo.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p_logo.add_run().add_picture(LOGO_PATH, width=Inches(1.8))
+            p_logo.add_run().add_picture(str(LOGO_PATH), width=Inches(1.8))
 
         p_title = doc.add_paragraph()
         p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -474,7 +481,7 @@ def generate_word(req: WordRequest):
         p_disc.paragraph_format.space_before = Pt(25)
         p_disc.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda estrictamente prohibida la divulgación o difusión de este archivo fuera de la empresa.")
+        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda strictly prohibida la divulgación o difusión de este archivo fuera de la empresa.")
         run_disc.font.size = Pt(8.5)
         run_disc.font.italic = True
         run_disc.font.bold = True
@@ -755,7 +762,7 @@ def validate_reference_request(req: ReferenceParseReq):
     cuerpo = normalizar_texto(req.body)
     texto_completo = f"{asunto} {cuerpo}"
 
-    # 1. BÚSQUEDA DE SUCURSAL / AGENCIA (SIEMPRE SE EJECUTA PRIMERO)
+    # 1. BÚSQUEDA DE SUCURSAL / AGENCIA
     mapeo_sucursales = {
         "Villas": [r"\bVILLAS?\b", r"\b331\b"],
         "San Miguel de Allende": [r"\bSAN\s+MIGUEL\b", r"\bSAN\s+MIGUEL\s+DE\s+ALLENDE\b", r"\b135\b", r"\bSMA\b"],
@@ -801,11 +808,10 @@ def validate_reference_request(req: ReferenceParseReq):
 
     branch_result = sucursal_encontrada if sucursal_encontrada else "GENERAL"
 
-    # 2. BÚSQUEDA DE IDENTIFICADOR (NUMERO_CLIENTE, RFC, CURP)
+    # 2. BÚSQUEDA DE IDENTIFICADOR
     id_tipo = None
     id_valor = None
 
-    # Búsqueda multi-patrón completa para número de cliente, RFC o CURP
     cliente_match = re.search(
         r'(?:\b(?:NO\.?|NUM\.?|NUMERO|N0\.?|N[°º]\.?|CLAVE|CVE|CODIGO|COD|ID)?\s*(?:DE\s*)?(?:CLIENTE|CTE|CLIE|IDCLIENTE)\b'
         r'|'
@@ -830,7 +836,6 @@ def validate_reference_request(req: ReferenceParseReq):
         id_tipo = "CURP"
         id_valor = re.sub(r'[\s\-]', '', curp_prefix.group(1))
     else:
-        # Coincidencias estrictas de RFC y CURP sin prefijos
         curp_strict_search = re.search(r'\b[A-Z][AEIOUX][A-Z]{2}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM][A-Z]{2}[B-DF-HJ-NP-TV-XYZ]{3}[0-9A-Z][0-9]\b', texto_completo)
         rfc_strict_search = re.search(r'\b[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{3}\b', texto_completo)
 
@@ -841,10 +846,8 @@ def validate_reference_request(req: ReferenceParseReq):
             id_tipo = "CURP"
             id_valor = curp_strict_search.group(0)
         else:
-            # Lista explícita de exclusión: códigos de agencia y códigos postales comunes
             EXCLUDED_NUMBERS = {"175", "135", "217", "184", "331", "192", "36130", "36540", "36250", "36000", "36500"}
 
-            # Búsqueda de número de cliente independiente (4 a 6 dígitos al inicio o aislado)
             standalone_numbers = re.finditer(r'\b([0-9]{4,6})\b', texto_completo)
             for num_m in standalone_numbers:
                 val = num_m.group(1)
@@ -858,7 +861,7 @@ def validate_reference_request(req: ReferenceParseReq):
                 id_valor = val
                 break
 
-    # 3. VALIDACIÓN DE ESTRUCTURA Y FORMATO
+    # 3. VALIDACIÓN DE ESTRUCTURA
     if id_tipo:
         RFC_STRICT = r'^[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{3}$'
         CURP_STRICT = r'^[A-Z][AEIOUX][A-Z]{2}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[HM][A-Z]{2}[B-DF-HJ-NP-TV-XYZ]{3}[0-9A-Z][0-9]$'
@@ -910,24 +913,23 @@ def validate_reference_request(req: ReferenceParseReq):
 @app.get("/descargar_archivo/{filepath:path}")
 def descargar_archivo(filepath: str):
     try:
-        base_dir = os.path.abspath(os.path.dirname(__file__))
-        target_path = os.path.abspath(os.path.join(base_dir, filepath))
+        target_path = (BASE_DIR / filepath).resolve()
 
-        if not target_path.startswith(base_dir):
+        if not str(target_path).startswith(str(BASE_DIR)):
             raise HTTPException(
                 status_code=400, 
                 detail="Acceso denegado: Intento de acceso a una ruta fuera del directorio permitido."
             )
 
-        if not os.path.exists(target_path) or not os.path.isfile(target_path):
+        if not target_path.exists() or not target_path.is_file():
             raise HTTPException(
                 status_code=404, 
                 detail=f"El archivo '{filepath}' no existe o no se encuentra disponible."
             )
 
         return FileResponse(
-            path=target_path, 
-            filename=os.path.basename(target_path)
+            path=str(target_path), 
+            filename=target_path.name
         )
     except HTTPException:
         raise
@@ -940,20 +942,29 @@ def descargar_archivo(filepath: str):
 def generar_responsiva(req: ResponsivaReq):
     try:
         tipo = req.tipo_plantilla.lower().strip()
-        filename_template = f"formato_{tipo}.docx" if tipo in ["laptop", "celular"] else f"formato_laptop.docx"
-        template_path = os.path.join(os.path.dirname(__file__), "plantillas", filename_template)
+        filename_template = f"formato_{tipo}.docx" if tipo in ["laptop", "celular"] else "formato_laptop.docx"
         
-        if not os.path.exists(template_path):
+        # 1. Intentar buscar dentro de la subcarpeta 'plantillas/'
+        template_path = PLANTILLAS_DIR / filename_template
+        
+        # 2. Búsqueda de respaldo directamente en la raíz (BASE_DIR)
+        if not template_path.exists():
+            template_path = BASE_DIR / filename_template
+            
+        if not template_path.exists():
+            disponibles_plantillas = [f.name for f in PLANTILLAS_DIR.glob("*.docx")] if PLANTILLAS_DIR.exists() else []
+            disponibles_raiz = [f.name for f in BASE_DIR.glob("*.docx")] if BASE_DIR.exists() else []
             raise HTTPException(
                 status_code=404, 
-                detail=f"No se encontró la plantilla '{filename_template}' en la carpeta 'plantillas/'."
+                detail=f"No se encontró la plantilla '{filename_template}' en '{PLANTILLAS_DIR}' ni en '{BASE_DIR}'. Disponibles en plantillas: {disponibles_plantillas}, en raíz: {disponibles_raiz}"
             )
             
-        doc = DocxTemplate(template_path)
+        doc = DocxTemplate(str(template_path))
         fecha_actual = datetime.now().strftime("%Y-%m-%d")
         
         context = {
             "unidad": req.unidad_negocio or "",
+            "Unidad": req.unidad_negocio or "",
             "sucursal": req.sucursal or "",
             "extension": req.extension or "",
             "nombre_completo": req.nombre_completo or "",
