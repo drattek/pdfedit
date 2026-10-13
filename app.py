@@ -51,7 +51,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PLANTILLAS_DIR = BASE_DIR / "plantillas"
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.18.0 - Catálogo de Equipos (Laptops y Celulares) & Responsivas Automáticas"
+VERSION = "2.18.1 - Mapeo Irapuato a Sucursal Solidaridad & Motor Nativo PyPDF2"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Motor Ligero PyPDF2 + Cabeceras TCP Seguras)")
@@ -621,7 +621,7 @@ def descarga_invoice(req: DownloadRequest):
         finally: browser.close()
 
 
-# --- ENDPOINT 6: EXTRACT COORDINATES (v1.44 / v1.70 PyPDF2) ---
+# --- ENDPOINT 6: EXTRACT COORDINATES ---
 @app.post("/extract_coordinates")
 def get_coordinates(req: CoordinateRequest):
     try:
@@ -637,7 +637,7 @@ def get_coordinates(req: CoordinateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ENDPOINT 7: FIND TEXT COORDS (v1.44 / v1.70 PyPDF2) ---
+# --- ENDPOINT 7: FIND TEXT COORDS ---
 @app.post("/find_text_coords")
 def find_text_coords(req: CoordinateRequest):
     try:
@@ -655,7 +655,7 @@ def find_text_coords(req: CoordinateRequest):
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ENDPOINT 8: EDIT INCOTERM (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
+# --- ENDPOINT 8: EDIT INCOTERM ---
 @app.post("/edit_incoterm", response_class=Response)
 def edit_incoterm(req: IncotermReq):
     try:
@@ -671,7 +671,7 @@ def edit_incoterm(req: IncotermReq):
         raise HTTPException(status_code=500, detail=f"Error en edit_incoterm: {str(e)}")
 
 
-# --- ENDPOINT 9: EDIT BILLSHIP (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
+# --- ENDPOINT 9: EDIT BILLSHIP ---
 @app.post("/edit_billship", response_class=Response)
 def edit_billship(req: BillShipReq):
     try:
@@ -694,7 +694,7 @@ def edit_billship(req: BillShipReq):
         raise HTTPException(status_code=500, detail=f"Error en edit_billship: {str(e)}")
 
 
-# --- ENDPOINT 10: OVERLAY TEXT BATCH (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
+# --- ENDPOINT 10: OVERLAY TEXT BATCH ---
 @app.post("/overlay_text_batch", response_class=Response)
 def overlay_text_batch(req: CustomBatchReq):
     try:
@@ -715,7 +715,7 @@ def overlay_text_batch(req: CustomBatchReq):
         raise HTTPException(status_code=500, detail=f"Error en overlay_text_batch: {str(e)}")
 
 
-# --- ENDPOINT 11: CUT RANGE (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
+# --- ENDPOINT 11: CUT RANGE ---
 @app.post("/cut_range", response_class=Response)
 def cut_range(req: CutRangeReq):
     try:
@@ -728,10 +728,11 @@ def cut_range(req: CutRangeReq):
             writer.add_page(reader.pages[i])
         return pdf_response(_export(writer), "recorte.pdf")
     except Exception as e:
+        print(f">>> [ERROR CUT_RANGE]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error en cut_range: {str(e)}")
 
 
-# --- ENDPOINT 12: EXTRACT CUSTOM PAGES (v1.44 / v1.70 PyPDF2 + Cabeceras v2.15) ---
+# --- ENDPOINT 12: EXTRACT CUSTOM PAGES ---
 @app.post("/extract_custom_pages", response_class=Response)
 def extract_custom_pages(req: CustomPagesReq):
     try:
@@ -766,7 +767,7 @@ def validate_reference_request(req: ReferenceParseReq):
         "Villas": [r"\bVILLAS?\b", r"\b331\b"],
         "San Miguel de Allende": [r"\bSAN\s+MIGUEL\b", r"\bSAN\s+MIGUEL\s+DE\s+ALLENDE\b", r"\b135\b", r"\bSMA\b"],
         "Guanajuato": [r"\b184\b", r"\bGUANAJUATO\b", r"\bGTO\b"],
-        "Solidaridad": [r"\bSOLI\b", r"\bSOLIDARIDAD\b", r"\b192\b"],
+        "Solidaridad": [r"\bSOLI\b", r"\bSOLIDARIDAD\b", r"\b192\b", r"\bIRAPUATO\b(?!\s*(?:VILLAS?|331)\b)"],
         "Silao": [r"\bSILAO\b", r"\b217\b"],
         "Salamanca": [r"\bSALAMANCA\b", r"\b175\b"]
     }
@@ -943,10 +944,7 @@ def generar_responsiva(req: ResponsivaReq):
         tipo = req.tipo_plantilla.lower().strip()
         filename_template = f"formato_{tipo}.docx" if tipo in ["laptop", "celular"] else "formato_laptop.docx"
         
-        # 1. Intentar buscar dentro de la subcarpeta 'plantillas/'
         template_path = PLANTILLAS_DIR / filename_template
-        
-        # 2. Búsqueda de respaldo directamente en la raíz (BASE_DIR)
         if not template_path.exists():
             template_path = BASE_DIR / filename_template
             
