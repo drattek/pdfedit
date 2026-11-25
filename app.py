@@ -51,7 +51,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PLANTILLAS_DIR = BASE_DIR / "plantillas"
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.18.1 - Mapeo Irapuato a Sucursal Solidaridad & Motor Nativo PyPDF2"
+VERSION = "2.19.0 - Soporte Plantilla Cuenta & Motor Nativo PyPDF2"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Motor Ligero PyPDF2 + Cabeceras TCP Seguras)")
@@ -481,7 +481,7 @@ def generate_word(req: WordRequest):
         p_disc.paragraph_format.space_before = Pt(25)
         p_disc.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda strictly prohibida la divulgación o difusión de este archivo fuera de la empresa.")
+        run_disc = p_disc.add_run("🔒 Documento para uso interno exclusivo de Grupo Vegusa. Queda estrictamente prohibida la divulgación o difusión de este archivo fuera de la empresa.")
         run_disc.font.size = Pt(8.5)
         run_disc.font.italic = True
         run_disc.font.bold = True
@@ -942,7 +942,8 @@ def descargar_archivo(filepath: str):
 def generar_responsiva(req: ResponsivaReq):
     try:
         tipo = req.tipo_plantilla.lower().strip()
-        filename_template = f"formato_{tipo}.docx" if tipo in ["laptop", "celular"] else "formato_laptop.docx"
+        tipos_validos = ["laptop", "celular", "cuenta"]
+        filename_template = f"formato_{tipo}.docx" if tipo in tipos_validos else "formato_laptop.docx"
         
         template_path = PLANTILLAS_DIR / filename_template
         if not template_path.exists():
