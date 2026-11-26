@@ -51,7 +51,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PLANTILLAS_DIR = BASE_DIR / "plantillas"
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.20.1 - Responsiva Cuenta PDF 1 Pagina Playwright & Motor PyPDF2"
+VERSION = "2.20.3 - Responsiva Cuenta PDF con Correo y Fecha & Motor PyPDF2"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Motor Ligero PyPDF2 + Cabeceras TCP Seguras)")
@@ -937,7 +937,7 @@ def descargar_archivo(filepath: str):
         raise HTTPException(status_code=500, detail=f"Error al descargar archivo: {str(e)}")
 
 
-# --- ENDPOINT 15: GENERAR CARTA RESPONSIVA (PDF 1 PAGINA PARA CUENTA / DOCX PARA LAPTOP Y CELULAR) ---
+# --- ENDPOINT 15: GENERAR CARTA RESPONSIVA (PDF 1 PAGINA EQUILIBRADA PARA CUENTA / DOCX PARA LAPTOP Y CELULAR) ---
 @app.post("/generar-responsiva", response_class=Response)
 def generar_responsiva(req: ResponsivaReq):
     try:
@@ -946,26 +946,26 @@ def generar_responsiva(req: ResponsivaReq):
         nombre_persona_limpio = normalizar_nombre(req.nombre_completo or "Empleado")
 
         if tipo == "cuenta":
-            logo_html = f'<img src="data:image/png;base64,{LOGO_B64}" style="max-height: 44px; width: auto;" />' if LOGO_B64 else '<b>GRUPO VEGUSA</b>'
+            logo_html = f'<img src="data:image/png;base64,{LOGO_B64}" style="max-height: 46px; width: auto;" />' if LOGO_B64 else '<b>GRUPO VEGUSA</b>'
             html_responsiva = f"""
             <!DOCTYPE html>
             <html lang="es">
             <head>
               <meta charset="UTF-8">
               <style>
-                @page {{ size: Letter; margin: 10mm 14mm 10mm 14mm; }}
-                body {{ font-family: Arial, Helvetica, sans-serif; color: #111827; font-size: 9.3pt; line-height: 1.28; margin: 0; padding: 0; }}
-                .header {{ text-align: left; margin-bottom: 4px; }}
-                h1 {{ font-size: 11.5pt; text-align: center; margin: 2px 0 10px 0; text-transform: uppercase; line-height: 1.2; }}
-                h2 {{ font-size: 9.8pt; margin: 8px 0 4px 0; }}
-                table {{ width: 100%; border-collapse: collapse; margin-bottom: 8px; font-size: 9pt; }}
-                td {{ border: 1px solid #374151; padding: 4px 6px; }}
-                .label {{ font-weight: bold; background-color: #f3f4f6; width: 20%; }}
-                p {{ margin: 4px 0; text-align: justify; }}
-                ol {{ margin: 4px 0 8px 18px; padding: 0; }}
-                li {{ margin-bottom: 3px; text-align: justify; }}
-                .firmas {{ margin-top: 16px; width: 100%; border: none; page-break-inside: avoid; }}
-                .firmas td {{ border: none; padding: 11px 2px 2px 2px; font-size: 9.3pt; }}
+                @page {{ size: Letter; margin: 12mm 15mm 12mm 15mm; }}
+                body {{ font-family: Arial, Helvetica, sans-serif; color: #111827; font-size: 9.8pt; line-height: 1.35; margin: 0; padding: 0; }}
+                .header {{ text-align: left; margin-bottom: 6px; }}
+                h1 {{ font-size: 12pt; text-align: center; margin: 4px 0 12px 0; text-transform: uppercase; line-height: 1.25; }}
+                h2 {{ font-size: 10.3pt; margin: 10px 0 5px 0; }}
+                table {{ width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 9.4pt; }}
+                td {{ border: 1px solid #374151; padding: 4.5px 8px; }}
+                .label {{ font-weight: bold; background-color: #f3f4f6; width: 21%; }}
+                p {{ margin: 5.5px 0; text-align: justify; }}
+                ol {{ margin: 5.5px 0 10px 20px; padding: 0; }}
+                li {{ margin-bottom: 3.5px; text-align: justify; }}
+                .firmas {{ margin-top: 24px; width: 100%; border: none; page-break-inside: avoid; }}
+                .firmas td {{ border: none; padding: 13px 2px 3px 2px; font-size: 9.8pt; }}
               </style>
             </head>
             <body>
@@ -987,6 +987,12 @@ def generar_responsiva(req: ResponsivaReq):
                 <tr>
                   <td class="label">Puesto:</td>
                   <td colspan="3">{req.puesto or ''}</td>
+                </tr>
+                <tr>
+                  <td class="label">Correo:</td>
+                  <td>{req.correo or ''}</td>
+                  <td class="label">Fecha:</td>
+                  <td>{fecha_actual}</td>
                 </tr>
               </table>
 
@@ -1034,7 +1040,7 @@ def generar_responsiva(req: ResponsivaReq):
                 pdf_bytes = page.pdf(
                     format="Letter",
                     print_background=True,
-                    margin={"top": "10mm", "bottom": "10mm", "left": "14mm", "right": "14mm"}
+                    margin={"top": "12mm", "bottom": "12mm", "left": "15mm", "right": "15mm"}
                 )
                 context.close()
                 browser.close()
