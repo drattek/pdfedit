@@ -51,7 +51,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PLANTILLAS_DIR = BASE_DIR / "plantillas"
 
 # --- CONTROL DE VERSIONES ---
-VERSION = "2.19.0 - Soporte Plantilla Cuenta & Motor Nativo PyPDF2"
+VERSION = "2.20.0 - Responsiva Cuenta PDF Nativo Playwright & Motor PyPDF2"
 print(f"\n{'='*40}")
 print(f" INICIANDO SERVICIO VEGUSA - VERSIÓN: {VERSION}")
 print(f" MODO: Producción n8n (Motor Ligero PyPDF2 + Cabeceras TCP Seguras)")
@@ -937,13 +937,111 @@ def descargar_archivo(filepath: str):
         raise HTTPException(status_code=500, detail=f"Error al descargar archivo: {str(e)}")
 
 
-# --- ENDPOINT 15: GENERAR CARTA RESPONSIVA CON PLANTILLA DOCX ---
+# --- ENDPOINT 15: GENERAR CARTA RESPONSIVA (PDF PARA CUENTA / DOCX PARA LAPTOP Y CELULAR) ---
 @app.post("/generar-responsiva", response_class=Response)
 def generar_responsiva(req: ResponsivaReq):
     try:
         tipo = req.tipo_plantilla.lower().strip()
-        tipos_validos = ["laptop", "celular", "cuenta"]
-        filename_template = f"formato_{tipo}.docx" if tipo in tipos_validos else "formato_laptop.docx"
+        fecha_actual = datetime.now().strftime("%Y-%m-%d")
+        nombre_persona_limpio = normalizar_nombre(req.nombre_completo or "Empleado")
+
+        if tipo == "cuenta":
+            logo_html = f'<img src="data:image/png;base64,{LOGO_B64}" style="max-height: 55px; width: auto;" />' if LOGO_B64 else '<b>GRUPO VEGUSA</b>'
+            html_responsiva = f"""
+            <!DOCTYPE html>
+            <html lang="es">
+            <head>
+              <meta charset="UTF-8">
+              <style>
+                body {{ font-family: Arial, Helvetica, sans-serif; color: #111827; font-size: 10.5pt; line-height: 1.42; margin: 0; padding: 0; }}
+                .header {{ text-align: left; margin-bottom: 10px; }}
+                h1 {{ font-size: 13pt; text-align: center; margin: 6px 0 14px 0; text-transform: uppercase; }}
+                h2 {{ font-size: 11pt; margin: 12px 0 6px 0; }}
+                table {{ width: 100%; border-collapse: collapse; margin-bottom: 14px; font-size: 10pt; }}
+                td {{ border: 1px solid #374151; padding: 6px 8px; }}
+                .label {{ font-weight: bold; background-color: #f3f4f6; width: 22%; }}
+                p {{ margin: 6px 0; text-align: justify; }}
+                ol {{ margin: 6px 0 12px 20px; padding: 0; }}
+                li {{ margin-bottom: 5px; text-align: justify; }}
+                .firmas {{ margin-top: 38px; width: 100%; border: none; }}
+                .firmas td {{ border: none; padding: 14px 4px 4px 4px; font-size: 10pt; }}
+              </style>
+            </head>
+            <body>
+              <div class="header">{logo_html}</div>
+              <h1>Carta Responsiva<br>Uso de Cuentas, Credenciales de Acceso y Sistemas de Información</h1>
+
+              <h2>Datos del colaborador</h2>
+              <table>
+                <tr>
+                  <td class="label">Nombre:</td>
+                  <td colspan="3">{req.nombre_completo or ''}</td>
+                </tr>
+                <tr>
+                  <td class="label">Unidad de negocio:</td>
+                  <td>{req.unidad_negocio or ''}</td>
+                  <td class="label">Departamento:</td>
+                  <td>{req.departamento or ''}</td>
+                </tr>
+                <tr>
+                  <td class="label">Puesto:</td>
+                  <td colspan="3">{req.puesto or ''}</td>
+                </tr>
+              </table>
+
+              <p>Declaro haber recibido acceso a los sistemas, plataformas tecnológicas y servicios digitales de Grupo VEGUSA y me comprometo a cumplir las siguientes disposiciones:</p>
+              <p>Las cuentas de usuario, correos electrónicos, accesos a sistemas, aplicaciones, portales web y servicios tecnológicos asignados para mis funciones labores dentro de Grupo Vegusa son de uso personal e intransferible.</p>
+              <p>Queda estrictamente prohibido compartir usuarios, contraseñas, códigos MFA, tokens, PIN, enlaces de autenticación o cualquier otro mecanismo de acceso.</p>
+              <p>No utilizaré credenciales de otro colaborador ni permitiré que terceros utilicen las mías.</p>
+              <p>Mantendré la confidencialidad de mis credenciales y notificaré inmediatamente cualquier sospecha de uso indebido, robo o compromiso de estas.</p>
+              <p>Toda actividad realizada con mis credenciales será asociada a mi cuenta y será considerada efectuada bajo mi responsabilidad, salvo evidencia técnica que demuestre lo contrario.</p>
+
+              <h2>SANCIONES POR INCUMPLIMIENTO</h2>
+              <p>El incumplimiento de cualquiera de las obligaciones establecidas en esta carta constituye una falta grave a las disposiciones de seguridad, confidencialidad y disciplina interna de Grupo VEGUSA y traerá como consecuencia las siguientes medidas:</p>
+              <ol type="a">
+                <li>Suspensión preventiva o definitiva de los accesos y privilegios tecnológicos, cuando resulte necesario para proteger los sistemas y la información de la empresa.</li>
+                <li>Aplicación de medidas disciplinarias conforme al Reglamento Interior de Trabajo y a las disposiciones laborales aplicables, respetando el procedimiento correspondiente.</li>
+                <li>Rescisión de la relación laboral sin responsabilidad para el patrón, cuando los hechos acreditados actualicen alguna de las causales previstas en el artículo 47 de la Ley Federal del Trabajo, cumpliendo las formalidades legales correspondientes.</li>
+                <li>Ejercicio de las acciones legales que resulten procedentes cuando la conducta pudiera constituir una infracción administrativa, un daño patrimonial o un ilícito, conforme a la legislación aplicable.</li>
+              </ol>
+
+              <p>Manifiesto que he leído, comprendido y aceptado el contenido de esta carta responsiva; que conozco las obligaciones y restricciones aquí establecidas y que asumo el compromiso de cumplirlas.</p>
+
+              <table class="firmas">
+                <tr><td>Nombre: __________________________________________________</td></tr>
+                <tr><td>Firma: ____________________________________________________</td></tr>
+                <tr><td>Fecha: ______________________</td></tr>
+              </table>
+            </body>
+            </html>
+            """
+
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage"
+                    ]
+                )
+                context = browser.new_context()
+                page = context.new_page()
+                page.set_default_timeout(30000)
+                page.set_content(html_responsiva, wait_until="domcontentloaded", timeout=30000)
+                
+                pdf_bytes = page.pdf(
+                    format="Letter",
+                    print_background=True,
+                    margin={"top": "14mm", "bottom": "14mm", "left": "16mm", "right": "16mm"}
+                )
+                context.close()
+                browser.close()
+
+            nombre_archivo = f"Responsiva_Cuenta_{nombre_persona_limpio}.pdf"
+            return pdf_response(pdf_bytes, nombre_archivo)
+
+        filename_template = f"formato_{tipo}.docx" if tipo in ["laptop", "celular"] else "formato_laptop.docx"
         
         template_path = PLANTILLAS_DIR / filename_template
         if not template_path.exists():
@@ -958,7 +1056,6 @@ def generar_responsiva(req: ResponsivaReq):
             )
             
         doc = DocxTemplate(str(template_path))
-        fecha_actual = datetime.now().strftime("%Y-%m-%d")
         
         context = {
             "unidad": req.unidad_negocio or "",
@@ -988,7 +1085,6 @@ def generar_responsiva(req: ResponsivaReq):
         doc.save(out_buf)
         docx_bytes = out_buf.getvalue()
         
-        nombre_persona_limpio = normalizar_nombre(req.nombre_completo or "Empleado")
         nombre_archivo = f"Responsiva_{tipo.capitalize()}_{nombre_persona_limpio}.docx"
 
         return docx_response(docx_bytes, nombre_archivo)
@@ -998,7 +1094,7 @@ def generar_responsiva(req: ResponsivaReq):
         print(f">>> [ERROR GENERAR-RESPONSIVA]: {str(e)}")
         raise HTTPException(
             status_code=500, 
-            detail=f"Error al procesar la plantilla Word de la carta responsiva: {str(e)}"
+            detail=f"Error al procesar la carta responsiva: {str(e)}"
         )
 
 
